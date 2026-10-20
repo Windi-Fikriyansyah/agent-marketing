@@ -21,13 +21,17 @@ export async function POST(req: NextRequest) {
 
     const agentName = agentData?.name || 'OpenAI Agent'
     const agentInstructions = agentData?.system_prompt || agentData?.description || ''
-    const agentModel = agentData?.model || process.env.OPENAI_DEFAULT_MODEL || 'gpt-4o-mini'
+    const agentModel = agentData?.model || body.model || process.env.OPENAI_DEFAULT_MODEL || 'gpt-4o-mini'
+    const connectedTools = agentData?.tools || body.connectedTools || []
+    const composioSessionId = agentData?.composio_session_id || body.composioSessionId || null
 
     const runtime = new AgentRuntime({
       agentId: agentId || 'default-agent',
       name: agentName,
       instructions: agentInstructions,
       model: agentModel,
+      composioSessionId,
+      connectedTools,
     })
 
     // Create a streaming SSE response

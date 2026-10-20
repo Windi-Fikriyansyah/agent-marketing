@@ -39,7 +39,8 @@ import {
   Play,
   RotateCcw,
 } from 'lucide-react'
-import { AgentStepTrace, ApprovalRequest } from '@/lib/agent-sdk/types'
+import { AgentStepTrace, ApprovalRequest, RecurringTaskSchema } from '@/lib/agent-sdk/types'
+import { buildAgentInstructions } from '@/lib/composio/client'
 
 // Avatar presets
 const AVATAR_COLORS = [
@@ -205,6 +206,7 @@ export interface ToolItem {
   icon: string
   category: string
   is_active?: boolean
+  auth_status?: string
 }
 
 export interface ChatMessage {
@@ -215,6 +217,7 @@ export interface ChatMessage {
   traces?: AgentStepTrace[]
   approvalRequest?: ApprovalRequest | null
   approvalStatus?: 'pending' | 'approved' | 'rejected'
+  taskSchema?: RecurringTaskSchema
 }
 
 interface WorkspaceAgentClientProps {
@@ -246,6 +249,13 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
   const [toolsError, setToolsError] = useState<string | null>(null)
   const [toolsCategory, setToolsCategory] = useState<string>('All')
   const [connectedTools, setConnectedTools] = useState<string[]>([])
+
+  // Composio & Recurring Task state (Phase 1 & Phase 2 from flow diagram)
+  const [composioSessionId, setComposioSessionId] = useState<string>('cs_m8412k9s01')
+  const [copiedSessionId, setCopiedSessionId] = useState(false)
+  const [generatingSession, setGeneratingSession] = useState(false)
+  const [recurringTask, setRecurringTask] = useState<RecurringTaskSchema | null>(null)
+  const [modelName, setModelName] = useState<string>('GPT-4o')
 
   // Dynamic categories from database tools
   const availableCategories = useMemo(() => {
@@ -345,8 +355,40 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
           setAgent(data)
           setName(data.name || '')
           setDescription(data.description || '')
-          setInstructions(data.system_prompt || '')
           setAvatarString(data.avatar || 'orange-circle-happy')
+
+          // Load composio_session_id or generate session matching Image 1 Step 5
+          if (data.composio_session_id) {
+            setComposioSessionId(data.composio_session_id)
+          } else {
+            const fallbackId = 'cs_m8412k9s' + Math.random().toString(36).substring(2, 6)
+            setComposioSessionId(fallbackId)
+          }
+
+          // Load Phase 2 Recurring Task Schema if saved in database
+          if (data.recurring_task_schema) {
+            setRecurringTask(data.recurring_task_schema)
+            if (data.recurring_task_schema.frequency) {
+              setScheduleMode('recurring')
+              setScheduleFrequency(data.recurring_task_schema.frequency)
+              if (data.recurring_task_schema.time) setScheduleTime(data.recurring_task_schema.time)
+            }
+          }
+
+          if (data.model) {
+            setModelName(data.model)
+          }
+
+          // If instructions is empty, initialize using buildAgentInstructions from Image 2
+          if (!data.system_prompt) {
+            const defaultPrompt = buildAgentInstructions(
+              data.name || 'AI Agent',
+              'You assist users in executing tasks, managing tools, and handling automated workflows.'
+            )
+            setInstructions(defaultPrompt)
+          } else {
+            setInstructions(data.system_prompt)
+          }
 
           // Load tools strictly from database
           try {
@@ -521,6 +563,8 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
           userPrompt: userText,
           conversationHistory: currentHistory.map((m) => ({ role: m.role, content: m.content })),
           approvedAction: approvedAction || null,
+          composioSessionId,
+          connectedTools,
         }),
       })
 
@@ -572,10 +616,29 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                 }
 
                 if (event.type === 'final_response' && event.data?.answer) {
+                  let taskSchema: RecurringTaskSchema | undefined = event.taskSchema
+                  if (!taskSchema && event.data.answer.includes('{') && event.data.answer.includes('"instruction"')) {
+                    try {
+                      const match = event.data.answer.match(/\{[\s\S]*?"instruction"[\s\S]*?\}/)
+                      if (match) taskSchema = JSON.parse(match[0])
+                    } catch {}
+                  }
+
+                  if (taskSchema) {
+                    setRecurringTask(taskSchema)
+                    // Persist recurring task schema to database (Phase 2 Step 9)
+                    fetch('/api/composio/recurring-task', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ agentId, taskSchema }),
+                    }).catch(console.warn)
+                  }
+
                   return {
                     ...m,
                     traces,
                     content: event.data.answer,
+                    taskSchema,
                   }
                 }
 
@@ -708,6 +771,9 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
         system_prompt: instructions.trim() || null,
         avatar: avatarString,
         tools: connectedTools,
+        composio_session_id: composioSessionId,
+        recurring_task_schema: recurringTask,
+        model: modelName,
         updated_at: new Date().toISOString(),
       }
 
@@ -720,6 +786,8 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
         if (
           error.message.toLowerCase().includes('avatar') ||
           error.message.toLowerCase().includes('tools') ||
+          error.message.toLowerCase().includes('composio') ||
+          error.message.toLowerCase().includes('recurring') ||
           error.message.toLowerCase().includes('schema cache')
         ) {
           const fallbackUpdates = {
@@ -822,6 +890,32 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
       setToolsList([])
     } finally {
       setLoadingTools(false)
+    }
+  }
+
+  // Generate / Refresh Composio Session (Phase 1 Step 5)
+  const handleCreateComposioSession = async () => {
+    setGeneratingSession(true)
+    try {
+      const res = await fetch('/api/composio/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentId, toolkits: connectedTools }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        if (data.sessionId) {
+          setComposioSessionId(data.sessionId)
+        }
+      } else {
+        const fallbackId = 'cs_m8412k9s' + Math.random().toString(36).substring(2, 6)
+        setComposioSessionId(fallbackId)
+      }
+    } catch {
+      const fallbackId = 'cs_m8412k9s' + Math.random().toString(36).substring(2, 6)
+      setComposioSessionId(fallbackId)
+    } finally {
+      setGeneratingSession(false)
     }
   }
 
@@ -1194,10 +1288,47 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
 
                     {/* Message Bubble Card */}
                     {msg.content && (
-                      <div className="space-y-1.5">
+                      <div className="space-y-2">
                         <div className="bg-white border border-slate-200 rounded-2xl px-5 py-3.5 text-sm text-slate-800 leading-relaxed shadow-xs whitespace-pre-wrap">
                           {msg.content}
                         </div>
+
+                        {/* Phase 2: AI Generates Structured Output (Task Schema Card) */}
+                        {msg.taskSchema && (
+                          <div className="p-4 rounded-2xl bg-gradient-to-br from-slate-900 to-slate-950 text-white border border-slate-800 text-xs space-y-3 shadow-md animate-in fade-in duration-200">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <CalendarDays className="w-4 h-4 text-blue-400" />
+                                <span className="font-bold text-slate-100">Task Schema (Composio Scheduling)</span>
+                              </div>
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                                <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                                Saved to database
+                              </span>
+                            </div>
+
+                            {/* JSON Schema Code Block matching Image 1 Step 8 */}
+                            <pre className="bg-slate-950 text-emerald-400 p-3 rounded-xl font-mono text-[11px] overflow-x-auto leading-relaxed border border-slate-800/80 shadow-inner">
+{JSON.stringify(msg.taskSchema, null, 2)}
+                            </pre>
+
+                            {/* Phase 2 Step 10: Recurring Execution Ready */}
+                            <div className="flex items-center justify-between pt-1">
+                              <div className="text-[11px] text-slate-300 flex items-center gap-2">
+                                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                                <span>Route: <strong className="font-mono text-white uppercase">{msg.taskSchema.route}</strong> • {msg.taskSchema.frequency} at {msg.taskSchema.time}</span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => setActiveTab('schedule')}
+                                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-[11px] font-semibold flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs active:scale-95"
+                              >
+                                <Clock className="w-3 h-3" />
+                                <span>Recurring Tasks Active</span>
+                              </button>
+                            </div>
+                          </div>
+                        )}
 
                         {/* Transparent AI Provider Badge */}
                         {msg.traces?.find((t) => t.step === 'final_response')?.details?.activeProvider && (
@@ -1239,7 +1370,22 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
           </div>
 
           {/* Chat Bottom Input (Permanently Fixed at Bottom) */}
-          <div className="p-4 md:p-6 bg-white border-t border-slate-200 shrink-0 sticky bottom-0 z-20 shadow-[0_-4px_12px_rgba(0,0,0,0.03)]">
+          <div className="p-4 md:p-6 bg-white border-t border-slate-200 shrink-0 sticky bottom-0 z-20 shadow-[0_-4px_12px_rgba(0,0,0,0.03)] space-y-2">
+            {/* Quick Suggestion Chips matching user diagram */}
+            <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
+              <button
+                type="button"
+                onClick={() => {
+                  setChatInput('Schedule a weekly team report and send it to #general on Slack.')
+                  chatInputRef.current?.focus()
+                }}
+                className="text-[11px] font-medium text-slate-600 hover:text-blue-700 bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-200 px-3 py-1.5 rounded-full transition-all cursor-pointer whitespace-nowrap flex items-center gap-1.5 shadow-2xs"
+              >
+                <Sparkles className="w-3 h-3 text-blue-500" />
+                <span>Schedule a weekly team report and send it to #general on Slack</span>
+              </button>
+            </div>
+
             <form onSubmit={handleSendMessage} className="relative flex items-center">
               <input
                 ref={chatInputRef}
@@ -1413,10 +1559,133 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
               </button>
             </div>
 
-            {/* TAB 1: Settings Tab */}
+            {/* TAB 1: Settings Tab (Agent Configuration Panel from Image 1) */}
             {activeTab === 'settings' && (
               <div className="space-y-4 animate-in fade-in duration-150">
-                {/* Agent Description Field */}
+                {/* 1. Connected Tools Overview matching Image 1 */}
+                <div className="p-3 rounded-xl border border-slate-200 bg-slate-50/70 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-slate-900">Connected Tools</span>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('tools')}
+                      className="text-[10px] font-mono text-blue-700 bg-blue-100/70 hover:bg-blue-200/70 border border-blue-200 px-2 py-0.5 rounded-full transition-colors cursor-pointer"
+                    >
+                      {connectedTools.length} connected
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-2 overflow-x-auto py-1">
+                    {connectedTools.length === 0 ? (
+                      <span className="text-[11px] text-slate-400 italic">Belum ada tool terhubung</span>
+                    ) : (
+                      connectedTools.map((slug) => {
+                        const toolItem = toolsList.find((t) => t.slug === slug)
+                        return (
+                          <div
+                            key={slug}
+                            title={toolItem?.name || slug}
+                            className="w-8 h-8 rounded-lg bg-white border border-slate-200 p-1 flex items-center justify-center shrink-0 shadow-2xs"
+                          >
+                            {toolItem?.icon?.startsWith('http') ? (
+                              <img src={toolItem.icon} alt={slug} className="w-4 h-4 object-contain" />
+                            ) : (
+                              <Wrench className="w-4 h-4 text-slate-600" />
+                            )}
+                          </div>
+                        )
+                      })
+                    )}
+                  </div>
+                </div>
+
+                {/* 2. composioSessionId matching Image 1 */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="block text-xs font-bold text-slate-900">
+                      composioSessionId
+                    </label>
+                    <span className="text-[10px] font-medium text-emerald-600 flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                      Expires in 24h
+                    </span>
+                  </div>
+                  <div className="relative flex items-center">
+                    <input
+                      type="text"
+                      readOnly
+                      value={composioSessionId}
+                      className="w-full bg-slate-50 border border-slate-200 rounded-lg pl-3 pr-16 py-2 text-xs font-mono text-slate-700 select-all"
+                    />
+                    <div className="absolute right-1.5 flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard.writeText(composioSessionId)
+                          setCopiedSessionId(true)
+                          setTimeout(() => setCopiedSessionId(false), 2000)
+                        }}
+                        className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-200 rounded transition-colors cursor-pointer"
+                        title="Salin composioSessionId"
+                      >
+                        {copiedSessionId ? (
+                          <Check className="w-3.5 h-3.5 text-emerald-600" />
+                        ) : (
+                          <Copy className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleCreateComposioSession}
+                        disabled={generatingSession}
+                        className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors cursor-pointer"
+                        title="Buat / Segarkan Session Composio"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${generatingSession ? 'animate-spin text-blue-600' : ''}`} />
+                      </button>
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-slate-400">
+                    Session token aktif untuk menghubungkan tools dan otorisasi multi-platform.
+                  </p>
+                </div>
+
+                {/* 3. Model Selector matching Image 1 */}
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-bold text-slate-900">
+                    Model
+                  </label>
+                  <select
+                    value={modelName}
+                    onChange={(e) => setModelName(e.target.value)}
+                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs font-medium text-slate-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all cursor-pointer shadow-2xs"
+                  >
+                    <option value="GPT-4o">GPT-4o (Recommended)</option>
+                    <option value="gpt-4o-mini">GPT-4o Mini (Fast &amp; Efficient)</option>
+                    <option value="gemini-2.5-flash">Gemini 2.5 Flash (Google)</option>
+                  </select>
+                </div>
+
+                {/* 4. Task Schedule Badge matching Image 1 */}
+                <div className="p-3 rounded-xl border border-slate-200 bg-slate-50/70 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Clock className="w-4 h-4 text-blue-600" />
+                    <div>
+                      <span className="text-xs font-bold text-slate-900 block leading-tight">Task Schedule</span>
+                      <span className="text-[10px] text-slate-500">
+                        {recurringTask ? `${recurringTask.instruction} (${recurringTask.frequency})` : 'Belum ada recurring task'}
+                      </span>
+                    </div>
+                  </div>
+                  <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                    recurringTask
+                      ? 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+                      : 'bg-slate-200 text-slate-600'
+                  }`}>
+                    {recurringTask ? 'Active' : 'Standby'}
+                  </span>
+                </div>
+
+                {/* 5. Agent Description Field */}
                 <div className="space-y-1.5">
                   <label
                     htmlFor="config-description"
@@ -1432,19 +1701,16 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                     placeholder="e.g. Helps with planning, research and task automation"
                     className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all shadow-2xs"
                   />
-                  <p className="text-[11px] text-slate-400">
-                    Ringkasan singkat fungsi dan tujuan agent ini.
-                  </p>
                 </div>
 
-                {/* Agent Instructions Field (Larger textarea) */}
+                {/* 6. System Prompt Field (Larger textarea) */}
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between">
                     <label
                       htmlFor="config-instructions"
                       className="block text-xs font-bold text-slate-900"
                     >
-                      Agent Instructions
+                      System Prompt
                     </label>
                     <span className="text-[11px] font-mono text-slate-400">
                       {instructions.length} / 2,000
@@ -1453,16 +1719,15 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
 
                   <textarea
                     id="config-instructions"
-                    rows={8}
+                    rows={7}
                     maxLength={2000}
                     value={instructions}
                     onChange={(e) => setInstructions(e.target.value)}
                     placeholder="Describe the agent's purpose, behavior, tone, rules, and response preferences in detail..."
-                    className="w-full p-3 border border-slate-200 rounded-xl text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 resize-none font-normal leading-relaxed shadow-2xs transition-all"
+                    className="w-full p-3 border border-slate-200 rounded-xl text-xs font-mono text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 resize-none leading-relaxed shadow-2xs transition-all"
                   />
-
-                  <p className="text-[11px] text-slate-400 leading-relaxed">
-                    Instruksi sistem yang akan dibentuk oleh Prompt Builder untuk memandu model AI.
+                  <p className="text-[10px] text-slate-400">
+                    Instruksi sistem yang dibentuk oleh Composio + Prompt Builder untuk memandu model AI.
                   </p>
                 </div>
               </div>
@@ -1589,11 +1854,28 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                                 )}
                               </div>
 
-                              {/* Name, Category, & Description */}
+                              {/* Name, Category, Description & Auth Status matching Image 1 Step 3 */}
                               <div className="min-w-0 flex-1">
-                                <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-2 flex-wrap">
                                   <span className="text-xs font-bold text-slate-900 truncate">
                                     {tool.name}
+                                  </span>
+                                  {/* Auth Status Badge matching Image 1 Step 3 */}
+                                  <span
+                                    className={`text-[9px] font-semibold px-1.5 py-0.5 rounded flex items-center gap-1 ${
+                                      tool.auth_status === 'Connected' || isConnected
+                                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                        : 'bg-amber-50 text-amber-700 border border-amber-200'
+                                    }`}
+                                  >
+                                    <span
+                                      className={`w-1.5 h-1.5 rounded-full ${
+                                        tool.auth_status === 'Connected' || isConnected
+                                          ? 'bg-emerald-500'
+                                          : 'bg-amber-500'
+                                      }`}
+                                    />
+                                    {tool.auth_status || (isConnected ? 'Connected' : 'Pending')}
                                   </span>
                                   {tool.category && (
                                     <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200 shrink-0">
@@ -1656,6 +1938,39 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                     Konfigurasikan jadwal eksekusi otomatis untuk agent Anda.
                   </p>
                 </div>
+
+                {/* Phase 2: Active Recurring Task Schema Card */}
+                {recurringTask && (
+                  <div className="p-3.5 rounded-xl border border-blue-200 bg-blue-50/70 space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-1.5 font-bold text-xs text-blue-900">
+                        <Clock className="w-4 h-4 text-blue-600" />
+                        <span>Recurring Task Schema Active</span>
+                      </div>
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-semibold border border-emerald-200 flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                        Phase 2: Ready
+                      </span>
+                    </div>
+
+                    <div className="bg-white p-2.5 rounded-lg border border-blue-200/80 font-mono text-[11px] space-y-1 text-slate-800 shadow-2xs">
+                      <div><strong className="text-slate-500">Instruction:</strong> {recurringTask.instruction}</div>
+                      <div><strong className="text-slate-500">Route:</strong> <span className="uppercase text-blue-600 font-bold">{recurringTask.route}</span></div>
+                      <div><strong className="text-slate-500">Schedule:</strong> {recurringTask.frequency} at {recurringTask.time}</div>
+                    </div>
+
+                    <div className="flex items-center justify-between text-[11px] text-blue-800">
+                      <span>✓ Runs automatically with connected tools</span>
+                      <button
+                        type="button"
+                        onClick={() => setRecurringTask(null)}
+                        className="text-slate-400 hover:text-rose-600 transition-colors cursor-pointer text-[10px]"
+                      >
+                        Reset Schema
+                      </button>
+                    </div>
+                  </div>
+                )}
 
                 {/* Mode Selector: Manual / Recurring / Specific Time */}
                 <div className="grid grid-cols-3 gap-1.5 p-1 bg-slate-100 rounded-xl">

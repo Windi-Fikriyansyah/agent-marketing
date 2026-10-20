@@ -5,8 +5,10 @@ import {
   AgentToolDefinition,
   ApprovalRequest,
   AgentExecutionContext,
+  RecurringTaskSchema,
 } from './types'
 import { DEFAULT_AGENT_TOOLS } from './tools/builtins'
+import { getAgentComposioTools } from './tools/composioTools'
 import { buildAgentInstructions } from './instructions'
 import { callGemini } from './providers/gemini'
 
@@ -20,8 +22,12 @@ export class AgentRuntime {
       model: config.model || process.env.OPENAI_DEFAULT_MODEL || 'gpt-4o-mini',
     }
 
-    const availableTools = config.tools || DEFAULT_AGENT_TOOLS
-    availableTools.forEach((tool) => {
+    // Attach Builtin and Composio Tools (Phase 1 Step 6: createAgent({ tools: [slack(), gmail(), ...] }))
+    const baseTools = config.tools || DEFAULT_AGENT_TOOLS
+    const composioTools = getAgentComposioTools(config.connectedTools || [])
+    const combinedTools = [...baseTools, ...composioTools]
+
+    combinedTools.forEach((tool) => {
       this.tools.set(tool.name, tool)
     })
   }
@@ -74,9 +80,75 @@ export class AgentRuntime {
     let plannedTools: string[] = []
     let reasoningNotes = ''
 
+    // Phase 2 Step 8: Detect if prompt requests a recurring schedule / task
+    let taskSchema: RecurringTaskSchema | undefined = undefined
+    const isScheduleIntent =
+      lower.includes('schedule') ||
+      lower.includes('jadwal') ||
+      lower.includes('weekly') ||
+      lower.includes('mingguan') ||
+      lower.includes('recurring') ||
+      lower.includes('rutin') ||
+      lower.includes('every') ||
+      lower.includes('setiap')
+
+    if (isScheduleIntent) {
+      let route = 'slack'
+      if (lower.includes('gmail') || lower.includes('email')) route = 'gmail'
+      else if (lower.includes('notion')) route = 'notion'
+      else if (lower.includes('docs') || lower.includes('google docs')) route = 'googledocs'
+      else if (lower.includes('calendar') || lower.includes('kalender')) route = 'googlecalendar'
+
+      let frequency: 'daily' | 'weekly' | 'monthly' | 'manual' = 'weekly'
+      if (lower.includes('daily') || lower.includes('harian') || lower.includes('setiap hari')) frequency = 'daily'
+      else if (lower.includes('monthly') || lower.includes('bulanan')) frequency = 'monthly'
+
+      const cleanInstruction = userPrompt
+        .replace(/^(schedule|jadwalkan|tolong jadwalkan|buatkan jadwal|please schedule)\s*(a|an|the)?/i, '')
+        .trim()
+
+      taskSchema = {
+        instruction: cleanInstruction || 'Send weekly team report',
+        route,
+        date: new Date().toISOString().split('T')[0],
+        time: '09:00',
+        frequency,
+      }
+    }
+
     if (options?.approvedAction) {
       plannedTools = [options.approvedAction.toolName]
       reasoningNotes = `Melanjutkan eksekusi aksi yang telah disetujui pengguna: ${options.approvedAction.toolName}`
+    } else if (isScheduleIntent) {
+      // Connect tools according to user flow in Image 1 (Gmail + Google Docs + Slack + Calendar)
+      plannedTools = []
+      if (this.tools.has('gmail')) plannedTools.push('gmail')
+      if (this.tools.has('googledocs')) plannedTools.push('googledocs')
+      if (this.tools.has('slack')) plannedTools.push('slack')
+      if (this.tools.has('googlecalendar')) plannedTools.push('googlecalendar')
+      if (plannedTools.length === 0) plannedTools = ['googlecalendar']
+      reasoningNotes = `Menyiapkan recurring task schedule untuk instruksi: "${taskSchema?.instruction}". Menghubungkan tool routing ke ${taskSchema?.route}.`
+    } else if (lower.includes('slack') || lower.includes('#general') || lower.includes('kirim ke slack')) {
+      if (this.tools.has('slack')) plannedTools.push('slack')
+      reasoningNotes = 'Mendeteksi instruksi pengiriman pesan atau notifikasi ke Slack via Composio.'
+    } else if (lower.includes('email') || lower.includes('gmail') || lower.includes('inbox')) {
+      if (this.tools.has('gmail')) plannedTools.push('gmail')
+      reasoningNotes = 'Mendeteksi instruksi pencarian atau pengelolaan email melalui Gmail via Composio.'
+    } else if (lower.includes('docs') || lower.includes('dokumen') || lower.includes('google docs')) {
+      if (this.tools.has('googledocs')) plannedTools.push('googledocs')
+      reasoningNotes = 'Mendeteksi kebutuhan pembuatan atau pembaruan berkas di Google Docs via Composio.'
+    } else if (lower.includes('notion')) {
+      if (this.tools.has('notion')) plannedTools.push('notion')
+      reasoningNotes = 'Mendeteksi pengelolaan halaman atau database Notion via Composio.'
+    } else if (lower.includes('calendar') || lower.includes('kalender') || lower.includes('meeting')) {
+      if (this.tools.has('googlecalendar')) plannedTools.push('googlecalendar')
+      reasoningNotes = 'Mendeteksi penjadwalan agenda di Google Calendar via Composio.'
+    } else if (lower.includes('github') || lower.includes('repo') || lower.includes('pull request')) {
+      if (this.tools.has('github')) plannedTools.push('github')
+      reasoningNotes = 'Mendeteksi manajemen repositori GitHub via Composio.'
+    } else if (lower.includes('reddit')) {
+      if (this.tools.has('reddit')) plannedTools.push('reddit')
+      reasoningNotes = 'Mendeteksi interaksi komunitas Reddit via Composio.'
     } else if (lower.includes('publish') || lower.includes('delete') || lower.includes('hapus') || lower.includes('sync')) {
       plannedTools = ['execute_sensitive_action']
       reasoningNotes = 'Terdeteksi permintaan aksi kritis/perubahan data. Memerlukan verifikasi persetujuan (Human-in-the-Loop).'
@@ -204,6 +276,23 @@ export class AgentRuntime {
           params = { expression: userPrompt }
         } else if (tool.name === 'database_query') {
           params = { topic: userPrompt }
+        } else if (tool.name === 'slack') {
+          const channelMatch = userPrompt.match(/#[a-zA-Z0-9_-]+/)
+          params = { channel: channelMatch ? channelMatch[0] : '#general', message: userPrompt }
+        } else if (tool.name === 'gmail') {
+          params = { action: 'search', query: userPrompt }
+        } else if (tool.name === 'googledocs') {
+          params = { title: 'Laporan Berkala Otomatis', content: userPrompt }
+        } else if (tool.name === 'notion') {
+          params = { action: 'create_page', title: userPrompt }
+        } else if (tool.name === 'googlecalendar') {
+          params = { summary: taskSchema?.instruction || userPrompt, time: taskSchema ? `${taskSchema.frequency} at ${taskSchema.time}` : '09:00' }
+        } else if (tool.name === 'github') {
+          params = { action: 'list_issues', repo: 'workspace/main' }
+        } else if (tool.name === 'reddit') {
+          params = { subreddit: 'technology', query: userPrompt }
+        } else if (tool.name === 'outlook') {
+          params = { action: 'read_inbox', subject: userPrompt }
         } else if (options?.approvedAction) {
           params = options.approvedAction.parameters
         }
@@ -359,6 +448,7 @@ export class AgentRuntime {
     step8Trace.details = {
       answerLength: finalAnswer.length,
       activeProvider,
+      taskSchema,
     }
     yield {
       type: 'final_response',
@@ -366,6 +456,7 @@ export class AgentRuntime {
       stepNumber: 8,
       trace: step8Trace,
       data: { answer: finalAnswer, provider: activeProvider },
+      taskSchema,
     }
   }
 }

@@ -47,6 +47,14 @@ export interface AgentExecutionContext {
   conversationId?: string
 }
 
+export interface RecurringTaskSchema {
+  instruction: string
+  route: string
+  date?: string
+  time: string
+  frequency: 'daily' | 'weekly' | 'monthly' | 'manual'
+}
+
 export interface AgentRuntimeConfig {
   agentId: string
   name: string
@@ -55,6 +63,8 @@ export interface AgentRuntimeConfig {
   tools?: AgentToolDefinition[]
   temperature?: number
   maxTurns?: number
+  composioSessionId?: string
+  connectedTools?: string[]
 }
 
 export interface AgentStreamEvent {
@@ -70,4 +80,5 @@ export interface AgentStreamEvent {
   stepNumber?: number
   trace?: AgentStepTrace
   data?: any
+  taskSchema?: RecurringTaskSchema
 }
