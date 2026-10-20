@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/client'
@@ -97,43 +97,115 @@ ON public.chat_messages FOR DELETE TO authenticated USING (auth.uid() = user_id)
 
 NOTIFY pgrst, 'reload schema';`
 
-const AVAILABLE_TOOLS = [
-  {
-    id: 'gmail',
-    name: 'Gmail',
-    category: 'Email & Communications',
-    bgClass: 'bg-red-50 text-red-600 border-red-200',
-    icon: Mail,
-  },
-  {
-    id: 'slack',
-    name: 'Slack',
-    category: 'Team Messaging',
-    bgClass: 'bg-purple-50 text-purple-600 border-purple-200',
-    icon: MessageSquare,
-  },
-  {
-    id: 'google_calendar',
-    name: 'Google Calendar',
-    category: 'Events & Scheduling',
-    bgClass: 'bg-blue-50 text-blue-600 border-blue-200',
-    icon: CalendarDays,
-  },
-  {
-    id: 'notion',
-    name: 'Notion',
-    category: 'Docs & Workspace',
-    bgClass: 'bg-slate-100 text-slate-800 border-slate-300',
-    icon: BookOpen,
-  },
-  {
-    id: 'github',
-    name: 'GitHub',
-    category: 'Code & Repositories',
-    bgClass: 'bg-slate-900 text-white border-slate-700',
-    icon: GitBranch,
-  },
-]
+const TOOLS_MIGRATION_SQL = `-- 1. Buat tabel tools
+CREATE TABLE IF NOT EXISTS public.tools (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  slug TEXT NOT NULL UNIQUE,
+  description TEXT,
+  icon TEXT,
+  category TEXT,
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tools_is_active ON public.tools(is_active);
+CREATE INDEX IF NOT EXISTS idx_tools_slug ON public.tools(slug);
+
+ALTER TABLE public.agents ADD COLUMN IF NOT EXISTS tools TEXT[] DEFAULT ARRAY[]::TEXT[];
+
+ALTER TABLE public.tools ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Allow read access to all users" ON public.tools;
+CREATE POLICY "Allow read access to all users" 
+ON public.tools FOR SELECT 
+TO authenticated, anon 
+USING (true);
+
+INSERT INTO public.tools ("name", "slug", "description", "icon", "category", "is_active")
+VALUES
+(
+  'Slack',
+  'slack',
+  'Send messages, read channels, and manage team notifications',
+  'https://cdn.simpleicons.org/slack/4A154B',
+  'Communication',
+  true
+),
+(
+  'Gmail',
+  'gmail',
+  'Read incoming emails, search threads, and draft or send replies',
+  'https://cdn.simpleicons.org/gmail/EA4335',
+  'Communication',
+  true
+),
+(
+  'Outlook',
+  'outlook',
+  'Send emails and read messages from Microsoft Outlook accounts',
+  'https://cdn.simpleicons.org/microsoftoutlook/0078D4',
+  'Communication',
+  true
+),
+(
+  'Notion',
+  'notion',
+  'Read, search, and update Notion workspace pages and databases',
+  'https://cdn.simpleicons.org/notion/000000',
+  'Productivity',
+  true
+),
+(
+  'Google Calendar',
+  'googlecalendar',
+  'Schedule meetings, check availability, and list calendar events',
+  'https://cdn.simpleicons.org/googlecalendar/4285F4',
+  'Productivity',
+  true
+),
+(
+  'Google Docs',
+  'googledocs',
+  'Create, read, and append content to Google Documents',
+  'https://cdn.simpleicons.org/googledocs/4285F4',
+  'Productivity',
+  true
+),
+(
+  'GitHub',
+  'github',
+  'Create issues, review pull requests, and query repository stats',
+  'https://cdn.simpleicons.org/github/181717',
+  'Development',
+  true
+),
+(
+  'Reddit',
+  'reddit',
+  'Read posts, search subreddits, and track community discussions',
+  'https://cdn.simpleicons.org/reddit/FF4500',
+  'Social',
+  true
+)
+ON CONFLICT (slug) DO UPDATE SET
+  name = EXCLUDED.name,
+  description = EXCLUDED.description,
+  icon = EXCLUDED.icon,
+  category = EXCLUDED.category,
+  is_active = EXCLUDED.is_active;
+
+NOTIFY pgrst, 'reload schema';`
+
+export interface ToolItem {
+  id?: string
+  name: string
+  slug: string
+  description: string
+  icon: string
+  category: string
+  is_active?: boolean
+}
 
 export interface ChatMessage {
   id: string
@@ -168,8 +240,20 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
   const [avatarString, setAvatarString] = useState('orange-circle-happy')
   const [activeTab, setActiveTab] = useState<'settings' | 'tools' | 'schedule' | 'agent_settings'>('settings')
 
-  // Tools Tab state (Composio Apps)
-  const [connectedTools, setConnectedTools] = useState<string[]>(['gmail', 'google_calendar'])
+  // Tools Tab state (Strictly from Database, no dummy data)
+  const [toolsList, setToolsList] = useState<ToolItem[]>([])
+  const [loadingTools, setLoadingTools] = useState<boolean>(true)
+  const [toolsError, setToolsError] = useState<string | null>(null)
+  const [toolsCategory, setToolsCategory] = useState<string>('All')
+  const [connectedTools, setConnectedTools] = useState<string[]>([])
+
+  // Dynamic categories from database tools
+  const availableCategories = useMemo(() => {
+    const categoriesFromDb = Array.from(
+      new Set(toolsList.map((t) => t.category).filter(Boolean))
+    )
+    return ['All', ...categoriesFromDb]
+  }, [toolsList])
 
   // Schedule Tab state
   const [scheduleMode, setScheduleMode] = useState<'manual' | 'recurring' | 'specific_time'>('recurring')
@@ -192,6 +276,7 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
   const [expandedTraceMsgId, setExpandedTraceMsgId] = useState<string | null>(null)
   const [chatTableMissingNotice, setChatTableMissingNotice] = useState(false)
   const [showSqlModal, setShowSqlModal] = useState(false)
+  const [sqlModalTab, setSqlModalTab] = useState<'tools' | 'chat'>('tools')
   const [copiedSql, setCopiedSql] = useState(false)
   const chatBottomRef = useRef<HTMLDivElement>(null)
   const chatInputRef = useRef<HTMLInputElement>(null)
@@ -262,6 +347,40 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
           setDescription(data.description || '')
           setInstructions(data.system_prompt || '')
           setAvatarString(data.avatar || 'orange-circle-happy')
+
+          // Load tools strictly from database
+          try {
+            setLoadingTools(true)
+            setToolsError(null)
+            const { data: dbTools, error: toolsError } = await supabase
+              .from('tools')
+              .select('*')
+              .eq('is_active', true)
+              .order('name', { ascending: true })
+
+            if (toolsError) {
+              console.error('Error fetching tools from database:', toolsError)
+              setToolsError(toolsError.message)
+              setToolsList([])
+            } else if (dbTools) {
+              setToolsList(dbTools)
+            } else {
+              setToolsList([])
+            }
+          } catch (tErr: any) {
+            console.error('Could not load tools from database:', tErr)
+            setToolsError(tErr?.message || 'Gagal terhubung ke tabel tools')
+            setToolsList([])
+          } finally {
+            setLoadingTools(false)
+          }
+
+          // Load connected tools for agent if saved in database
+          if (data.tools && Array.isArray(data.tools)) {
+            setConnectedTools(data.tools)
+          } else {
+            setConnectedTools([])
+          }
 
           // 1. Try to load chat history directly from Supabase
           let loadedFromSupabase = false
@@ -588,6 +707,7 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
         description: description.trim() || null,
         system_prompt: instructions.trim() || null,
         avatar: avatarString,
+        tools: connectedTools,
         updated_at: new Date().toISOString(),
       }
 
@@ -599,6 +719,7 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
       if (error) {
         if (
           error.message.toLowerCase().includes('avatar') ||
+          error.message.toLowerCase().includes('tools') ||
           error.message.toLowerCase().includes('schema cache')
         ) {
           const fallbackUpdates = {
@@ -676,6 +797,31 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
   const handleResetAgent = async () => {
     if (confirm('Reset agent akan membersihkan riwayat percakapan?')) {
       await handleClearChat()
+    }
+  }
+
+  // Fetch Tools directly from Database
+  const fetchDatabaseTools = async () => {
+    setLoadingTools(true)
+    setToolsError(null)
+    try {
+      const { data: dbTools, error: tErr } = await supabase
+        .from('tools')
+        .select('*')
+        .eq('is_active', true)
+        .order('name', { ascending: true })
+
+      if (tErr) {
+        setToolsError(tErr.message)
+        setToolsList([])
+      } else {
+        setToolsList(dbTools || [])
+      }
+    } catch (err: any) {
+      setToolsError(err?.message || 'Gagal memuat tools')
+      setToolsList([])
+    } finally {
+      setLoadingTools(false)
     }
   }
 
@@ -775,24 +921,8 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
               </div>
             </div>
 
-            {/* Action buttons: Database Status, Clear Chat & Active Toggle */}
+            {/* Action buttons: Clear Chat & Active Toggle */}
             <div className="flex items-center gap-2 sm:gap-3">
-              {/* Database status button */}
-              <button
-                type="button"
-                onClick={() => setShowSqlModal(true)}
-                className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium border rounded-lg transition-colors cursor-pointer ${
-                  chatTableMissingNotice
-                    ? 'text-amber-700 bg-amber-50 border-amber-300 hover:bg-amber-100'
-                    : 'text-slate-600 bg-slate-50 hover:bg-blue-50 hover:text-blue-600 border-slate-200'
-                }`}
-                title={chatTableMissingNotice ? 'Database Supabase belum aktif' : 'Database Supabase aktif'}
-              >
-                <Database className={`w-3.5 h-3.5 ${chatTableMissingNotice ? 'text-amber-600 animate-pulse' : 'text-emerald-500'}`} />
-                <span className="hidden sm:inline">
-                  {chatTableMissingNotice ? 'Perlu Migrasi DB' : 'DB Sync'}
-                </span>
-              </button>
 
               {chatMessages.length > 0 && (
                 <button
@@ -1340,64 +1470,180 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
 
             {/* TAB 2: Tools Tab */}
             {activeTab === 'tools' && (
-              <div className="space-y-3.5 animate-in fade-in duration-150">
+              <div className="space-y-4 animate-in fade-in duration-150">
                 <div className="flex items-center justify-between">
                   <div>
                     <h4 className="text-xs font-bold text-slate-900">Connected Tools</h4>
                     <p className="text-[11px] text-slate-500">
-                      Hubungkan tools dan aplikasi via Composio registry.
+                      Pilih dan hubungkan tools aplikasi dari database untuk agent ini.
                     </p>
                   </div>
-                  <span className="text-[10px] font-mono text-blue-700 bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded">
-                    Composio Tools
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={fetchDatabaseTools}
+                      disabled={loadingTools}
+                      title="Muat ulang dari database"
+                      className="p-1 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-md transition-colors cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${loadingTools ? 'animate-spin text-blue-600' : ''}`} />
+                    </button>
+                    <span className="text-[10px] font-mono text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-full">
+                      {connectedTools.length} Aktif
+                    </span>
+                  </div>
                 </div>
 
-                <div className="space-y-2">
-                  {AVAILABLE_TOOLS.map((tool) => {
-                    const isConnected = connectedTools.includes(tool.id)
-                    const IconComp = tool.icon
-                    return (
-                      <div
-                        key={tool.id}
-                        className="flex items-center justify-between p-3 rounded-xl border border-slate-200 bg-white hover:border-slate-300 transition-all shadow-2xs"
-                      >
-                        <div className="flex items-center gap-3 min-w-0">
-                          <div className={`w-8 h-8 rounded-lg flex items-center justify-center border shrink-0 ${tool.bgClass}`}>
-                            <IconComp className="w-4 h-4" />
-                          </div>
-                          <div className="min-w-0">
-                            <div className="text-xs font-semibold text-slate-900 truncate">
-                              {tool.name}
-                            </div>
-                            <div className="text-[10px] text-slate-400 truncate">
-                              {tool.category}
-                            </div>
-                          </div>
-                        </div>
-
+                {/* Category Filter Pills (if tools available) */}
+                {availableCategories.length > 1 && (
+                  <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none">
+                    {availableCategories.map((cat) => {
+                      const count = cat === 'All' ? toolsList.length : toolsList.filter((t) => t.category === cat).length
+                      return (
                         <button
+                          key={cat}
                           type="button"
-                          onClick={() => toggleConnectTool(tool.id)}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 shadow-2xs ${
-                            isConnected
-                              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'
-                              : 'bg-white hover:bg-slate-50 text-slate-700 border border-slate-200'
+                          onClick={() => setToolsCategory(cat)}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-medium whitespace-nowrap transition-all cursor-pointer ${
+                            toolsCategory === cat
+                              ? 'bg-slate-900 text-white font-semibold shadow-xs'
+                              : 'bg-slate-100 hover:bg-slate-200 text-slate-600'
                           }`}
                         >
-                          {isConnected ? (
-                            <>
-                              <Check className="w-3.5 h-3.5 text-emerald-600" />
-                              <span>Connected</span>
-                            </>
-                          ) : (
-                            <span>Connect</span>
-                          )}
+                          {cat} <span className="opacity-70 text-[10px]">({count})</span>
                         </button>
-                      </div>
-                    )
-                  })}
-                </div>
+                      )
+                    })}
+                  </div>
+                )}
+
+                {/* Loading state */}
+                {loadingTools ? (
+                  <div className="py-12 text-center space-y-2.5">
+                    <RefreshCw className="w-5 h-5 animate-spin text-blue-600 mx-auto" />
+                    <p className="text-xs text-slate-600 font-medium">Memuat data tools dari database...</p>
+                    <p className="text-[11px] text-slate-400">Mengambil dari tabel public.tools</p>
+                  </div>
+                ) : toolsError ? (
+                  <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-xs space-y-2.5">
+                    <div className="flex items-center gap-2 font-bold text-amber-800">
+                      <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                      <span>Gagal Mengambil Data Tools Dari Database</span>
+                    </div>
+                    <p className="text-[11px] text-amber-700 leading-relaxed">
+                      {toolsError}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={fetchDatabaseTools}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-[11px] font-semibold cursor-pointer shadow-xs transition-colors"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>Coba Muat Ulang</span>
+                    </button>
+                  </div>
+                ) : toolsList.length === 0 ? (
+                  <div className="py-10 px-4 text-center rounded-xl border border-dashed border-slate-300 bg-slate-50/60 space-y-3">
+                    <div className="w-10 h-10 rounded-full bg-slate-100 text-slate-400 flex items-center justify-center mx-auto">
+                      <Wrench className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h5 className="text-xs font-bold text-slate-800">Belum Ada Tools di Database</h5>
+                      <p className="text-[11px] text-slate-500 max-w-xs mx-auto leading-relaxed mt-1">
+                        Tabel <code className="font-mono text-blue-600 font-semibold">public.tools</code> belum memiliki data aktif. Masukkan data ke database dengan perintah SQL INSERT.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={fetchDatabaseTools}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded-lg text-xs font-semibold cursor-pointer shadow-2xs"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>Refresh dari Database</span>
+                    </button>
+                  </div>
+                ) : (
+                  /* Tools List strictly from database */
+                  <div className="space-y-2.5">
+                    {toolsList
+                      .filter((t) => toolsCategory === 'All' || t.category === toolsCategory)
+                      .map((tool) => {
+                        const isConnected = connectedTools.includes(tool.slug)
+                        return (
+                          <div
+                            key={tool.slug}
+                            className="flex items-start justify-between p-3 rounded-xl border border-slate-200 bg-white hover:border-slate-300 transition-all shadow-2xs gap-3"
+                          >
+                            <div className="flex items-start gap-3 min-w-0 flex-1">
+                              {/* App Icon (SimpleIcons CDN or Fallback) */}
+                              <div className="w-9 h-9 rounded-xl flex items-center justify-center bg-slate-50 border border-slate-200 shrink-0 p-1.5 shadow-2xs mt-0.5">
+                                {tool.icon?.startsWith('http') ? (
+                                  <img
+                                    src={tool.icon}
+                                    alt={tool.name}
+                                    className="w-5 h-5 object-contain"
+                                    loading="lazy"
+                                  />
+                                ) : (
+                                  <Wrench className="w-4 h-4 text-slate-600" />
+                                )}
+                              </div>
+
+                              {/* Name, Category, & Description */}
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs font-bold text-slate-900 truncate">
+                                    {tool.name}
+                                  </span>
+                                  {tool.category && (
+                                    <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200 shrink-0">
+                                      {tool.category}
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-[11px] text-slate-500 leading-snug line-clamp-2 mt-0.5">
+                                  {tool.description}
+                                </p>
+                              </div>
+                            </div>
+
+                            {/* Connect / Connected Button */}
+                            <button
+                              type="button"
+                              onClick={() => toggleConnectTool(tool.slug)}
+                              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 shrink-0 shadow-2xs mt-1 ${
+                                isConnected
+                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'
+                                  : 'bg-white hover:bg-slate-50 text-slate-700 border border-slate-200'
+                              }`}
+                            >
+                              {isConnected ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                  <span>Connected</span>
+                                </>
+                              ) : (
+                                <span>Connect</span>
+                              )}
+                            </button>
+                          </div>
+                        )
+                      })}
+                  </div>
+                )}
+
+                {/* Database Info Indicator */}
+                {!loadingTools && !toolsError && toolsList.length > 0 && (
+                  <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200/80 text-slate-500 text-[11px] flex items-center justify-between">
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />
+                      <span>Data dari database: <code className="font-mono text-blue-600 font-semibold">public.tools</code></span>
+                    </span>
+                    <span className="text-[10px] text-slate-600 font-medium">
+                      {toolsList.length} Tools Siap
+                    </span>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1613,19 +1859,20 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
         </aside>
       </div>
 
-      {/* SQL Migration Modal for Supabase Chat Persistence */}
+      {/* SQL Migration Modal for Supabase Database Persistence */}
       {showSqlModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-xs animate-in fade-in duration-150">
           <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-2xl w-full max-h-[85vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-150">
+            {/* Modal Header */}
             <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50/80">
               <div className="flex items-center gap-2.5">
                 <div className="w-8 h-8 rounded-lg bg-blue-100 text-blue-600 flex items-center justify-center">
                   <Database className="w-4 h-4" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-bold text-slate-900">Sinkronisasi Database Chat History</h3>
+                  <h3 className="text-sm font-bold text-slate-900">Skrip Migrasi SQL Supabase</h3>
                   <p className="text-xs text-slate-500">
-                    Skrip migrasi SQL untuk tabel Supabase <code className="text-blue-600 font-mono">public.chat_messages</code>
+                    Jalankan skrip ini di Supabase Dashboard &rarr; SQL Editor
                   </p>
                 </div>
               </div>
@@ -1638,52 +1885,115 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
               </button>
             </div>
 
-            <div className="p-6 overflow-y-auto space-y-4 text-xs text-slate-600">
-              <p className="leading-relaxed">
-                Sistem chat telah siap dan otomatis tersambung ke Supabase. Agar riwayat pesan, respon multi-model (OpenAI &amp; Gemini), serta 8-step Agent SDK execution traces tersimpan permanen di cloud (dapat diakses di browser/perangkat manapun), jalankan skrip SQL berikut di menu <strong>Supabase Dashboard &rarr; SQL Editor</strong>.
-              </p>
+            {/* Modal Tab Switcher */}
+            <div className="flex items-center gap-2 border-b border-slate-200 px-6 pt-2 bg-slate-50/50">
+              <button
+                type="button"
+                onClick={() => setSqlModalTab('tools')}
+                className={`pb-2.5 px-3 text-xs font-semibold border-b-2 -mb-[1px] transition-colors cursor-pointer ${
+                  sqlModalTab === 'tools'
+                    ? 'border-blue-600 text-blue-600'
+                    : 'border-transparent text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                1. Tabel Tools (8 Aplikasi)
+              </button>
+              <button
+                type="button"
+                onClick={() => setSqlModalTab('chat')}
+                className={`pb-2.5 px-3 text-xs font-semibold border-b-2 -mb-[1px] transition-colors cursor-pointer ${
+                  sqlModalTab === 'chat'
+                    ? 'border-blue-600 text-blue-600'
+                    : 'border-transparent text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                2. Tabel Chat Messages
+              </button>
+            </div>
 
-              <div className="relative group">
-                <pre className="bg-slate-900 text-slate-100 p-4 rounded-xl font-mono text-[11px] overflow-x-auto max-h-64 leading-relaxed selection:bg-blue-600 selection:text-white">
-                  {CHAT_MIGRATION_SQL}
-                </pre>
-                <button
-                  type="button"
-                  onClick={() => {
-                    navigator.clipboard.writeText(CHAT_MIGRATION_SQL)
-                    setCopiedSql(true)
-                    setTimeout(() => setCopiedSql(false), 2000)
-                  }}
-                  className="absolute top-3 right-3 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
-                >
-                  {copiedSql ? (
-                    <>
-                      <Check className="w-3.5 h-3.5 text-white" />
-                      <span>Tersalin!</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="w-3.5 h-3.5" />
-                      <span>Salin SQL</span>
-                    </>
-                  )}
-                </button>
-              </div>
+            <div className="p-6 overflow-y-auto space-y-4 text-xs text-slate-600">
+              {sqlModalTab === 'tools' ? (
+                <>
+                  <p className="leading-relaxed">
+                    Skrip SQL berikut membuat tabel <code className="font-mono text-blue-600 font-semibold">public.tools</code>, menambahkan kolom <code className="font-mono text-blue-600 font-semibold">tools</code> pada tabel agents, dan langsung mengisikan data 8 tools (Slack, Gmail, Outlook, Notion, Calendar, Docs, GitHub, Reddit) lengkap dengan icon CDN.
+                  </p>
+
+                  <div className="relative group">
+                    <pre className="bg-slate-900 text-slate-100 p-4 rounded-xl font-mono text-[11px] overflow-x-auto max-h-64 leading-relaxed selection:bg-blue-600 selection:text-white">
+                      {TOOLS_MIGRATION_SQL}
+                    </pre>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(TOOLS_MIGRATION_SQL)
+                        setCopiedSql(true)
+                        setTimeout(() => setCopiedSql(false), 2000)
+                      }}
+                      className="absolute top-3 right-3 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
+                    >
+                      {copiedSql ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-white" />
+                          <span>Tersalin!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>Salin SQL Tools</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p className="leading-relaxed">
+                    Skrip SQL berikut membuat tabel <code className="font-mono text-blue-600 font-semibold">public.chat_messages</code> untuk menyimpan riwayat percakapan dan multi-step execution traces secara aman dengan Row Level Security (RLS).
+                  </p>
+
+                  <div className="relative group">
+                    <pre className="bg-slate-900 text-slate-100 p-4 rounded-xl font-mono text-[11px] overflow-x-auto max-h-64 leading-relaxed selection:bg-blue-600 selection:text-white">
+                      {CHAT_MIGRATION_SQL}
+                    </pre>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(CHAT_MIGRATION_SQL)
+                        setCopiedSql(true)
+                        setTimeout(() => setCopiedSql(false), 2000)
+                      }}
+                      className="absolute top-3 right-3 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
+                    >
+                      {copiedSql ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-white" />
+                          <span>Tersalin!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>Salin SQL Chat</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </>
+              )}
 
               <div className="p-3 rounded-lg bg-blue-50 border border-blue-200 text-blue-900 text-[11px] space-y-1">
                 <div className="font-semibold flex items-center gap-1.5">
                   <CheckCircle2 className="w-3.5 h-3.5 text-blue-600" />
-                  Keamanan Row Level Security (RLS) Diaktifkan
+                  Keamanan &amp; Performa Optimal
                 </div>
                 <p className="text-blue-700">
-                  Setiap pengguna hanya dapat membaca dan menulis riwayat percakapan milik agent mereka sendiri dengan aman.
+                  Semua tabel telah dilengkapi dengan index pencarian cepat serta Row Level Security (RLS) terisolasi.
                 </p>
               </div>
             </div>
 
             <div className="px-6 py-3.5 border-t border-slate-200 bg-slate-50 flex items-center justify-between">
               <span className="text-[11px] text-slate-500">
-                File lokal: <code className="font-mono">supabase/migration_add_chat_messages.sql</code>
+                File lokal: <code className="font-mono">{sqlModalTab === 'tools' ? 'supabase/migration_add_tools.sql' : 'supabase/migration_add_chat_messages.sql'}</code>
               </span>
               <button
                 type="button"
