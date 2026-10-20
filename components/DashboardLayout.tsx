@@ -229,7 +229,11 @@ export default function DashboardLayout({
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col md:flex-row antialiased selection:bg-blue-600 selection:text-white">
+    <div
+      className={`bg-slate-50 text-slate-900 flex flex-col md:flex-row antialiased selection:bg-blue-600 selection:text-white ${
+        hideTopHeader ? 'h-screen h-[100dvh] max-h-screen overflow-hidden' : 'min-h-screen'
+      }`}
+    >
       {/* Mobile Top Header */}
       <div className="md:hidden flex items-center justify-between px-4 py-3 bg-white border-b border-slate-200 sticky top-0 z-40">
         <div className="flex items-center gap-2.5">
@@ -389,7 +393,11 @@ export default function DashboardLayout({
       </aside>
 
       {/* Main Content Area */}
-      <main className="flex-1 min-w-0 flex flex-col bg-slate-50">
+      <main
+        className={`flex-1 min-w-0 flex flex-col bg-slate-50 ${
+          hideTopHeader ? 'h-full max-h-screen overflow-hidden min-h-0' : ''
+        }`}
+      >
         {/* Top Header / Action Bar */}
         {!hideTopHeader && (
           <div className="h-14 border-b border-slate-200 bg-white/90 backdrop-blur-sm px-6 flex items-center justify-between sticky top-0 z-30">
@@ -440,7 +448,13 @@ export default function DashboardLayout({
         )}
 
         {/* Page Content Body */}
-        <div className="flex-1 min-w-0 flex flex-col">{children}</div>
+        <div
+          className={`flex-1 min-w-0 flex flex-col ${
+            hideTopHeader ? 'h-full max-h-screen overflow-hidden min-h-0' : ''
+          }`}
+        >
+          {children}
+        </div>
       </main>
     </div>
   )

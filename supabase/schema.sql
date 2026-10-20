@@ -134,5 +134,56 @@ CREATE TRIGGER on_agents_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ==============================================================================
--- SELESAI: Skema tabel profiles & agents di Supabase siap digunakan!
+-- 9. TABEL CHAT_MESSAGES (RIWAYAT PERCAKAPAN AGENT SDK)
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS public.chat_messages (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id UUID NOT NULL REFERENCES public.agents(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (role IN ('user', 'agent')),
+  content TEXT NOT NULL DEFAULT '',
+  traces JSONB DEFAULT '[]'::jsonb,
+  approval_request JSONB DEFAULT NULL,
+  approval_status TEXT DEFAULT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_messages_agent_id_created_at 
+ON public.chat_messages(agent_id, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_chat_messages_user_id 
+ON public.chat_messages(user_id);
+
+ALTER TABLE public.chat_messages ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users can view their own chat messages" ON public.chat_messages;
+CREATE POLICY "Users can view their own chat messages" 
+ON public.chat_messages FOR SELECT 
+TO authenticated 
+USING (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Users can insert their own chat messages" ON public.chat_messages;
+CREATE POLICY "Users can insert their own chat messages" 
+ON public.chat_messages FOR INSERT 
+TO authenticated 
+WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Users can update their own chat messages" ON public.chat_messages;
+CREATE POLICY "Users can update their own chat messages" 
+ON public.chat_messages FOR UPDATE 
+TO authenticated 
+USING (auth.uid() = user_id)
+WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Users can delete their own chat messages" ON public.chat_messages;
+CREATE POLICY "Users can delete their own chat messages" 
+ON public.chat_messages FOR DELETE 
+TO authenticated 
+USING (auth.uid() = user_id);
+
+-- Muat ulang schema cache PostgREST PostgREST Supabase
+NOTIFY pgrst, 'reload schema';
+
+-- ==============================================================================
+-- SELESAI: Skema tabel profiles, agents, & chat_messages siap digunakan!
 -- ==============================================================================
