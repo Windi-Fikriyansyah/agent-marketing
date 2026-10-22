@@ -1,213 +1,282 @@
 import { z } from 'zod'
 import { AgentToolDefinition } from '../types'
+import { composio } from '@/lib/composio/client'
 
 /**
- * 1. Slack Tool (Composio Toolkit)
- * Post messages to channels, send direct messages, read conversations
+ * 1. Slack Tool (Real Composio Toolkit)
  */
 export const slackTool: AgentToolDefinition = {
   name: 'slack',
   description: 'Send messages, post notifications, or read channels in Slack workspace.',
   parameters: z.object({
-    channel: z.string().describe('Slack channel name (e.g. "#general") or member ID'),
-    message: z.string().describe('The message content to send'),
+    channel: z.string().describe('Slack channel name (e.g. "#general" or "C01234567")'),
+    message: z.string().describe('The message content to post'),
   }),
   requireApproval: false,
-  execute: async ({ channel, message }) => {
+  execute: async ({ channel, message }, context) => {
+    const userUuid = context.userId || 'default_user'
+    const result = await composio.executeAction('SLACK_CHAT_POST_MESSAGE', {
+      userUuid,
+      data: {
+        channel,
+        text: message,
+      },
+    })
+
+    if (!result.successful) {
+      return {
+        status: 'error',
+        toolkit: 'slack',
+        channel,
+        error: result.error,
+        connectionUrl: result.connectionUrl,
+        summary: `Gagal mengirim ke Slack (${channel}): ${result.error}. ${
+          result.connectionUrl ? `Silakan hubungkan akun Slack Anda di: ${result.connectionUrl}` : ''
+        }`,
+      }
+    }
+
     return {
       status: 'success',
       toolkit: 'slack',
       channel,
       message,
-      deliveredAt: new Date().toISOString(),
-      summary: `Pesan berhasil dikirim ke saluran ${channel} di Slack: "${message}"`,
+      data: result.data,
+      summary: `Pesan berhasil dikirimkan ke saluran ${channel} di Slack: "${message}"`,
     }
   },
 }
 
 /**
- * 2. Gmail Tool (Composio Toolkit)
- * Read incoming emails, search threads, draft or send replies
+ * 2. Gmail Tool (Real Composio Toolkit)
  */
 export const gmailTool: AgentToolDefinition = {
   name: 'gmail',
-  description: 'Read incoming emails, search email threads, and draft or send replies.',
+  description: 'Send emails, draft replies, or search emails via Gmail.',
   parameters: z.object({
-    action: z.enum(['search', 'send_draft', 'read_latest']).describe('Action to perform in Gmail'),
-    query: z.string().optional().describe('Search query, recipient, or subject line'),
+    recipient: z.string().describe('Recipient email address'),
+    subject: z.string().describe('Email subject line'),
+    body: z.string().describe('Email body content in plain text or HTML'),
   }),
-  requireApproval: false,
-  execute: async ({ action, query }) => {
+  requireApproval: true, // Sending emails is sensitive -> Requires Human Approval
+  execute: async ({ recipient, subject, body }, context) => {
+    const userUuid = context.userId || 'default_user'
+    const result = await composio.executeAction('GMAIL_SEND_EMAIL', {
+      userUuid,
+      data: {
+        recipient_email: recipient,
+        subject,
+        body,
+      },
+    })
+
+    if (!result.successful) {
+      return {
+        status: 'error',
+        toolkit: 'gmail',
+        recipient,
+        error: result.error,
+        connectionUrl: result.connectionUrl,
+        summary: `Gagal mengirim email via Gmail ke ${recipient}: ${result.error}`,
+      }
+    }
+
     return {
       status: 'success',
       toolkit: 'gmail',
-      action,
-      query: query || 'all',
-      timestamp: new Date().toISOString(),
-      summary: `Berhasil mengakses Gmail (${action}) untuk kueri: ${query || 'terbaru'}.`,
+      recipient,
+      subject,
+      data: result.data,
+      summary: `Email berhasil dikirim via Gmail ke ${recipient} dengan subjek "${subject}".`,
     }
   },
 }
 
 /**
- * 3. Google Docs Tool (Composio Toolkit)
- * Create documents, read existing documents, append content
- */
-export const googleDocsTool: AgentToolDefinition = {
-  name: 'googledocs',
-  description: 'Create, read, and append content to Google Documents.',
-  parameters: z.object({
-    title: z.string().describe('Document title or filename'),
-    content: z.string().optional().describe('Content to write or append to document'),
-  }),
-  requireApproval: false,
-  execute: async ({ title, content }) => {
-    return {
-      status: 'success',
-      toolkit: 'googledocs',
-      title,
-      documentId: `doc_${Date.now()}`,
-      url: `https://docs.google.com/document/d/doc_${Date.now()}/edit`,
-      summary: `Dokumen Google Docs "${title}" berhasil disiapkan dan diperbarui.`,
-    }
-  },
-}
-
-/**
- * 4. Notion Tool (Composio Toolkit)
- * Read, search, and update workspace pages & databases
- */
-export const notionTool: AgentToolDefinition = {
-  name: 'notion',
-  description: 'Read, search, and update Notion workspace pages, notes, and databases.',
-  parameters: z.object({
-    action: z.enum(['search_page', 'create_page', 'append_database']).describe('Action to perform in Notion'),
-    title: z.string().describe('Title of page or database record'),
-  }),
-  requireApproval: false,
-  execute: async ({ action, title }) => {
-    return {
-      status: 'success',
-      toolkit: 'notion',
-      action,
-      title,
-      pageId: `notion_${Date.now()}`,
-      summary: `Halaman Notion "${title}" berhasil diproses via Composio integration.`,
-    }
-  },
-}
-
-/**
- * 5. Google Calendar Tool (Composio Toolkit)
- * Schedule meetings, check availability, and list calendar events
+ * 3. Google Calendar Tool (Real Composio Toolkit)
  */
 export const googleCalendarTool: AgentToolDefinition = {
   name: 'googlecalendar',
-  description: 'Schedule meetings, check availability, and list calendar events.',
+  description: 'Create events or schedule meetings in Google Calendar.',
   parameters: z.object({
-    summary: z.string().describe('Event title or summary'),
-    time: z.string().describe('Event date/time or recurring pattern, e.g. "09:00" or "Every Monday 09:00"'),
+    summary: z.string().describe('Event title or meeting name'),
+    description: z.string().optional().describe('Description or agenda of the meeting'),
+    startDatetime: z.string().describe('Start date and time in ISO format or descriptive (e.g. 2026-10-23T09:00:00)'),
+    durationMinutes: z.number().optional().describe('Duration in minutes, default 30'),
   }),
   requireApproval: false,
-  execute: async ({ summary, time }) => {
+  execute: async ({ summary, description, startDatetime, durationMinutes = 30 }, context) => {
+    const userUuid = context.userId || 'default_user'
+    const result = await composio.executeAction('GOOGLECALENDAR_CREATE_EVENT', {
+      userUuid,
+      data: {
+        summary,
+        description: description || '',
+        start_datetime: startDatetime,
+        duration: durationMinutes,
+      },
+    })
+
+    if (!result.successful) {
+      return {
+        status: 'error',
+        toolkit: 'googlecalendar',
+        error: result.error,
+        connectionUrl: result.connectionUrl,
+        summary: `Gagal membuat agenda di Google Calendar: ${result.error}`,
+      }
+    }
+
     return {
       status: 'success',
       toolkit: 'googlecalendar',
       summary,
-      time,
-      eventId: `cal_${Date.now()}`,
-      scheduledAt: new Date().toISOString(),
-      resultMessage: `Agenda "${summary}" berhasil dijadwalkan pada ${time} di Google Calendar.`,
+      time: startDatetime,
+      data: result.data,
+      summaryText: `Agenda "${summary}" berhasil dijadwalkan di Google Calendar pada ${startDatetime}.`,
     }
   },
 }
 
 /**
- * 6. GitHub Tool (Composio Toolkit)
+ * 4. Google Docs Tool (Real Composio Toolkit)
+ */
+export const googleDocsTool: AgentToolDefinition = {
+  name: 'googledocs',
+  description: 'Create a new Google Document with specified title and content.',
+  parameters: z.object({
+    title: z.string().describe('Document title'),
+    content: z.string().optional().describe('Initial text content of the document'),
+  }),
+  requireApproval: false,
+  execute: async ({ title, content }, context) => {
+    const userUuid = context.userId || 'default_user'
+    const result = await composio.executeAction('GOOGLEDOCS_CREATE_DOCUMENT', {
+      userUuid,
+      data: {
+        title,
+        text: content || '',
+      },
+    })
+
+    if (!result.successful) {
+      return {
+        status: 'error',
+        toolkit: 'googledocs',
+        title,
+        error: result.error,
+        summary: `Gagal membuat Google Docs "${title}": ${result.error}`,
+      }
+    }
+
+    return {
+      status: 'success',
+      toolkit: 'googledocs',
+      title,
+      data: result.data,
+      summary: `Dokumen Google Docs "${title}" berhasil dibuat dan disimpan.`,
+    }
+  },
+}
+
+/**
+ * 5. Notion Tool (Real Composio Toolkit)
+ */
+export const notionTool: AgentToolDefinition = {
+  name: 'notion',
+  description: 'Create or append a page to Notion workspace.',
+  parameters: z.object({
+    title: z.string().describe('Title of the Notion page'),
+    content: z.string().optional().describe('Text body of the page'),
+  }),
+  requireApproval: false,
+  execute: async ({ title, content }, context) => {
+    const userUuid = context.userId || 'default_user'
+    const result = await composio.executeAction('NOTION_CREATE_NOTION_PAGE', {
+      userUuid,
+      data: {
+        title,
+        content: content || '',
+      },
+    })
+
+    if (!result.successful) {
+      return {
+        status: 'error',
+        toolkit: 'notion',
+        title,
+        error: result.error,
+        summary: `Gagal memproses Notion "${title}": ${result.error}`,
+      }
+    }
+
+    return {
+      status: 'success',
+      toolkit: 'notion',
+      title,
+      data: result.data,
+      summary: `Halaman Notion "${title}" berhasil dibuat via Composio.`,
+    }
+  },
+}
+
+/**
+ * 6. GitHub Tool (Real Composio Toolkit)
  */
 export const gitHubTool: AgentToolDefinition = {
   name: 'github',
-  description: 'Create issues, review pull requests, and query repository stats.',
+  description: 'Create an issue in a GitHub repository.',
   parameters: z.object({
-    action: z.enum(['list_issues', 'create_issue', 'repo_info']).describe('GitHub action'),
-    repo: z.string().describe('Repository name (owner/repo)'),
+    owner: z.string().describe('GitHub repository owner or organization'),
+    repo: z.string().describe('GitHub repository name'),
+    title: z.string().describe('Issue title'),
+    body: z.string().optional().describe('Issue description body'),
   }),
   requireApproval: false,
-  execute: async ({ action, repo }) => {
+  execute: async ({ owner, repo, title, body }, context) => {
+    const userUuid = context.userId || 'default_user'
+    const result = await composio.executeAction('GITHUB_CREATE_AN_ISSUE', {
+      userUuid,
+      data: {
+        owner,
+        repo,
+        title,
+        body: body || '',
+      },
+    })
+
+    if (!result.successful) {
+      return {
+        status: 'error',
+        toolkit: 'github',
+        error: result.error,
+        summary: `Gagal membuat issue di ${owner}/${repo}: ${result.error}`,
+      }
+    }
+
     return {
       status: 'success',
       toolkit: 'github',
-      action,
+      owner,
       repo,
-      summary: `Berhasil menjalankan operasi ${action} pada repository ${repo} via GitHub.`,
+      title,
+      data: result.data,
+      summary: `Issue "${title}" berhasil dipublikasikan di repositori ${owner}/${repo}.`,
     }
   },
 }
 
-/**
- * 7. Reddit Tool (Composio Toolkit)
- */
-export const redditTool: AgentToolDefinition = {
-  name: 'reddit',
-  description: 'Read posts, search subreddits, and track community discussions.',
-  parameters: z.object({
-    subreddit: z.string().describe('Subreddit name (without r/)'),
-    query: z.string().optional().describe('Search keyword or topic'),
-  }),
-  requireApproval: false,
-  execute: async ({ subreddit, query }) => {
-    return {
-      status: 'success',
-      toolkit: 'reddit',
-      subreddit,
-      query: query || '',
-      summary: `Berhasil mengambil diskusi komunitas dari r/${subreddit}.`,
-    }
-  },
-}
-
-/**
- * 8. Outlook Tool (Composio Toolkit)
- */
-export const outlookTool: AgentToolDefinition = {
-  name: 'outlook',
-  description: 'Send emails and read messages from Microsoft Outlook accounts.',
-  parameters: z.object({
-    action: z.enum(['read_inbox', 'send_email']).describe('Outlook operation'),
-    subject: z.string().optional().describe('Email subject'),
-  }),
-  requireApproval: false,
-  execute: async ({ action, subject }) => {
-    return {
-      status: 'success',
-      toolkit: 'outlook',
-      action,
-      subject: subject || 'Untitled',
-      summary: `Operasi Outlook (${action}) berhasil dijalankan.`,
-    }
-  },
-}
-
-/**
- * Map of all Composio tools by slug
- */
 export const COMPOSIO_TOOLS_MAP: Record<string, AgentToolDefinition> = {
   slack: slackTool,
   gmail: gmailTool,
+  googlecalendar: googleCalendarTool,
   googledocs: googleDocsTool,
   notion: notionTool,
-  googlecalendar: googleCalendarTool,
   github: gitHubTool,
-  reddit: redditTool,
-  outlook: outlookTool,
 }
 
-/**
- * Get active agent tools filtered by connected tool slugs
- */
 export function getAgentComposioTools(connectedSlugs: string[] = []): AgentToolDefinition[] {
   if (!connectedSlugs || connectedSlugs.length === 0) {
-    // Return all default composio tools if none specified
     return Object.values(COMPOSIO_TOOLS_MAP)
   }
   return connectedSlugs

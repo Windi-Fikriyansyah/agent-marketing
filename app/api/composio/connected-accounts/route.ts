@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { getActiveConnectedAccounts } from '@/lib/composio/client'
+import { composio } from '@/lib/composio/client'
 
 /**
- * Image 2: GET COMPOSIO CONNECT TOOLS LIST
- * Calls getActiveConnectedAccounts(userEmail, toolSlugs)
+ * GET connected accounts for user from Composio API
  */
 export async function GET(req: NextRequest) {
   try {
@@ -17,13 +16,23 @@ export async function GET(req: NextRequest) {
     const slugsParam = searchParams.get('tools')
     const toolSlugs = slugsParam ? slugsParam.split(',').map((s) => s.trim().toLowerCase()) : []
 
-    const userEmail = user?.email || 'user@example.com'
-    const connectedAccounts = await getActiveConnectedAccounts(userEmail, toolSlugs)
+    const userEmail = user?.email || user?.id || 'default_user'
+    const accounts = await composio.listConnectedAccounts(userEmail, toolSlugs)
+
+    // Map into lookup dictionary
+    const connectedAccounts = accounts.reduce((acc: Record<string, string[]>, account) => {
+      const slug = account.appName.toLowerCase()
+      if (!acc[slug]) acc[slug] = []
+      acc[slug].push(account.id)
+      return acc
+    }, {})
 
     return NextResponse.json({
       success: true,
       userEmail,
+      accounts,
       connectedAccounts,
+      isConfigured: composio.isConfigured,
     })
   } catch (err: any) {
     console.error('Error fetching connected accounts:', err)

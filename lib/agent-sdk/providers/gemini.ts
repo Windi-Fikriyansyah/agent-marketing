@@ -1,123 +1,169 @@
 /**
- * Google Gemini Provider for Agent SDK (Automatic Fallback)
+ * Google Gemini Provider for Agent SDK with Real Native Function Calling
  * Connects directly to Google Generative Language API
  */
 
-export interface GeminiCallOptions {
+export interface GeminiToolDeclaration {
+  name: string
+  description: string
+  parameters: {
+    type: 'OBJECT'
+    properties: Record<string, {
+      type: 'STRING' | 'NUMBER' | 'BOOLEAN' | 'ARRAY' | 'OBJECT'
+      description?: string
+      enum?: string[]
+    }>
+    required?: string[]
+  }
+}
+
+export interface GeminiMessagePart {
+  text?: string
+  functionCall?: {
+    name: string
+    args: Record<string, any>
+  }
+  functionResponse?: {
+    name: string
+    response: Record<string, any>
+  }
+}
+
+export interface GeminiContent {
+  role: 'user' | 'model' | 'function'
+  parts: GeminiMessagePart[]
+}
+
+export interface GeminiRunOptions {
   apiKey: string
   model?: string
   systemInstruction?: string
-  conversationHistory?: { role: 'user' | 'agent'; content: string }[]
-  userPrompt: string
-  toolResults?: any[]
+  contents: GeminiContent[]
+  tools?: GeminiToolDeclaration[]
+  temperature?: number
 }
 
-export async function callGemini(options: GeminiCallOptions): Promise<{
+export interface GeminiRunResult {
   success: boolean
   content?: string
+  functionCalls?: Array<{
+    name: string
+    args: Record<string, any>
+  }>
+  rawCandidate?: any
   provider: string
   error?: string
-}> {
-  const { apiKey, systemInstruction, conversationHistory = [], userPrompt, toolResults = [] } = options
-  const model = options.model || process.env.GEMINI_DEFAULT_MODEL || 'gemini-2.5-flash'
+}
+
+const CANDIDATE_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-1.5-flash',
+  'gemini-flash-latest',
+]
+
+export async function callGeminiRaw(options: GeminiRunOptions): Promise<GeminiRunResult> {
+  const { apiKey, systemInstruction, contents, tools = [], temperature = 0.5 } = options
+  const targetModel = options.model || process.env.GEMINI_DEFAULT_MODEL || 'gemini-2.5-flash'
 
   if (!apiKey || apiKey.trim().length === 0) {
-    return { success: false, provider: 'Google Gemini', error: 'No GEMINI_API_KEY provided.' }
+    return {
+      success: false,
+      provider: 'Google Gemini',
+      error: 'GEMINI_API_KEY tidak ditemukan. Harap tambahkan di .env.local',
+    }
   }
 
-  try {
-    // Format Gemini contents payload
-    const contents: any[] = []
+  // Format request payload
+  const payload: any = {
+    contents,
+    generationConfig: {
+      temperature,
+      maxOutputTokens: 2048,
+    },
+  }
 
-    // Map conversation history
-    for (const msg of conversationHistory) {
-      contents.push({
-        role: msg.role === 'agent' ? 'model' : 'user',
-        parts: [{ text: msg.content }],
-      })
+  if (systemInstruction && systemInstruction.trim().length > 0) {
+    payload.systemInstruction = {
+      parts: [{ text: systemInstruction }],
     }
+  }
 
-    // Append latest user message + tool results context
-    let currentMessageText = userPrompt
-    if (toolResults.length > 0) {
-      currentMessageText += `\n\n[Hasil Eksekusi Tool Agent SDK]:\n${JSON.stringify(toolResults, null, 2)}`
-    }
-
-    contents.push({
-      role: 'user',
-      parts: [{ text: currentMessageText }],
-    })
-
-    const payload: any = {
-      contents,
-      generationConfig: {
-        temperature: 0.7,
-        maxOutputTokens: 2048,
+  if (tools && tools.length > 0) {
+    payload.tools = [
+      {
+        functionDeclarations: tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          parameters: {
+            type: 'OBJECT',
+            properties: t.parameters.properties,
+            required: t.parameters.required || [],
+          },
+        })),
       },
-    }
+    ]
+  }
 
-    if (systemInstruction) {
-      payload.systemInstruction = {
-        parts: [{ text: systemInstruction }],
+  const modelsToTry = Array.from(new Set([targetModel, ...CANDIDATE_MODELS]))
+  let lastError = 'No models responded'
+
+  for (const modelName of modelsToTry) {
+    try {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey.trim()}`
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+
+      if (!res.ok) {
+        const errorText = await res.text()
+        lastError = `Model ${modelName} returned HTTP ${res.status}: ${errorText.slice(0, 200)}`
+        console.warn(`[Gemini Provider] ${modelName} failed (${res.status}), trying next candidate...`)
+        continue
       }
-    }
 
-    // Ordered candidate models for automatic multi-model redundancy
-    const candidateModels = Array.from(
-      new Set([
-        model || 'gemini-flash-latest',
-        'gemini-flash-latest',
-        'gemini-flash-lite-latest',
-        'gemini-3.5-flash',
-        'gemini-2.5-flash',
-      ])
-    )
-
-    let lastError = 'No models available'
-
-    for (const currentModel of candidateModels) {
-      try {
-        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${apiKey.trim()}`
-
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        })
-
-        if (!res.ok) {
-          const errBody = await res.text()
-          lastError = `Model ${currentModel} returned ${res.status}: ${errBody.slice(0, 150)}`
-          console.warn(`Gemini model ${currentModel} error (${res.status}), trying next candidate...`)
-          continue
-        }
-
-        const data = await res.json()
-        const generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text
-
-        if (generatedText && generatedText.trim().length > 0) {
-          return {
-            success: true,
-            content: generatedText,
-            provider: `Google Gemini (${currentModel})`,
-          }
-        }
-      } catch (err: any) {
-        lastError = err.message || 'Network error'
-        console.warn(`Gemini model ${currentModel} network error, trying next candidate...`, err)
+      const data = await res.json()
+      const candidate = data.candidates?.[0]
+      if (!candidate) {
+        lastError = `Model ${modelName} returned empty candidate`
+        continue
       }
-    }
 
-    return {
-      success: false,
-      provider: 'Google Gemini',
-      error: lastError,
+      const parts: GeminiMessagePart[] = candidate.content?.parts || []
+      const functionCalls: Array<{ name: string; args: Record<string, any> }> = []
+      let textContent = ''
+
+      for (const part of parts) {
+        if (part.functionCall) {
+          functionCalls.push({
+            name: part.functionCall.name,
+            args: part.functionCall.args || {},
+          })
+        }
+        if (part.text) {
+          textContent += (textContent ? '\n' : '') + part.text
+        }
+      }
+
+      return {
+        success: true,
+        content: textContent,
+        functionCalls: functionCalls.length > 0 ? functionCalls : undefined,
+        rawCandidate: candidate,
+        provider: `Google Gemini (${modelName})`,
+      }
+    } catch (err: any) {
+      lastError = err.message || 'Network error'
+      console.warn(`[Gemini Provider] Network error with ${modelName}:`, err)
     }
-  } catch (err: any) {
-    return {
-      success: false,
-      provider: 'Google Gemini',
-      error: err.message || 'Network error calling Gemini API',
-    }
+  }
+
+  return {
+    success: false,
+    provider: 'Google Gemini',
+    error: lastError,
   }
 }

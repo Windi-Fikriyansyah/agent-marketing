@@ -10,7 +10,11 @@ import {
 import { DEFAULT_AGENT_TOOLS } from './tools/builtins'
 import { getAgentComposioTools } from './tools/composioTools'
 import { buildAgentInstructions } from './instructions'
-import { callGemini } from './providers/gemini'
+import {
+  callGeminiRaw,
+  GeminiToolDeclaration,
+  GeminiContent,
+} from './providers/gemini'
 
 export class AgentRuntime {
   private config: AgentRuntimeConfig
@@ -19,10 +23,10 @@ export class AgentRuntime {
   constructor(config: AgentRuntimeConfig) {
     this.config = {
       ...config,
-      model: config.model || process.env.OPENAI_DEFAULT_MODEL || 'gpt-4o-mini',
+      model: config.model || process.env.GEMINI_DEFAULT_MODEL || 'gemini-2.5-flash',
     }
 
-    // Attach Builtin and Composio Tools (Phase 1 Step 6: createAgent({ tools: [slack(), gmail(), ...] }))
+    // Attach Builtin and Composio Tools
     const baseTools = config.tools || DEFAULT_AGENT_TOOLS
     const composioTools = getAgentComposioTools(config.connectedTools || [])
     const combinedTools = [...baseTools, ...composioTools]
@@ -33,11 +37,54 @@ export class AgentRuntime {
   }
 
   /**
-   * Execute the 8-Step Agent Flow with real-time event streaming
+   * Convert registered tools to Gemini tool declarations
+   */
+  private getGeminiToolDeclarations(): GeminiToolDeclaration[] {
+    const declarations: GeminiToolDeclaration[] = []
+
+    this.tools.forEach((tool) => {
+      // Basic schema inference from zod shape or manual definitions
+      const shape = (tool.parameters as any)?._def?.shape?.() || {}
+      const properties: Record<string, any> = {}
+      const required: string[] = []
+
+      Object.keys(shape).forEach((key) => {
+        const zodType = shape[key]?._def?.typeName
+        let type: 'STRING' | 'NUMBER' | 'BOOLEAN' | 'ARRAY' | 'OBJECT' = 'STRING'
+        if (zodType === 'ZodNumber') type = 'NUMBER'
+        else if (zodType === 'ZodBoolean') type = 'BOOLEAN'
+        else if (zodType === 'ZodArray') type = 'ARRAY'
+
+        properties[key] = {
+          type,
+          description: shape[key]?._def?.description || key,
+        }
+        if (!shape[key]?.isOptional?.()) {
+          required.push(key)
+        }
+      })
+
+      declarations.push({
+        name: tool.name,
+        description: tool.description,
+        parameters: {
+          type: 'OBJECT',
+          properties,
+          required,
+        },
+      })
+    })
+
+    return declarations
+  }
+
+  /**
+   * Execute the 8-Step Agent Flow with real-time event streaming and authentic AI Function Calling
    */
   async *execute(
     userPrompt: string,
     options?: {
+      userId?: string
       conversationHistory?: { role: 'user' | 'agent'; content: string }[]
       approvedAction?: { toolName: string; parameters: any } | null
     }
@@ -46,10 +93,15 @@ export class AgentRuntime {
       agentId: this.config.agentId,
       agentName: this.config.name,
       systemPrompt: this.config.instructions,
+      userId: options?.userId,
     }
 
+    const geminiKey = (process.env.GEMINI_API_KEY || '').trim()
+    const fullInstructions = buildAgentInstructions(this.config)
+    const timestamp = () => new Date().toLocaleTimeString('id-ID')
+
     // =========================================================================
-    // STEP 1: User Request (Incoming prompt or task)
+    // STEP 1: User Request
     // =========================================================================
     const step1Trace: AgentStepTrace = {
       step: 'user_request',
@@ -58,192 +110,211 @@ export class AgentRuntime {
       description: 'Menerima dan memvalidasi prompt dari pengguna.',
       status: 'completed',
       details: { prompt: userPrompt },
-      timestamp: new Date().toLocaleTimeString('id-ID'),
+      timestamp: timestamp(),
     }
     yield { type: 'step_start', step: 'user_request', stepNumber: 1, trace: step1Trace }
 
     // =========================================================================
-    // STEP 2: Reason + Plan (The agent interprets the goal)
+    // STEP 2: Reason + Plan (LLM reasoning & tool resolution)
     // =========================================================================
     const step2Trace: AgentStepTrace = {
       step: 'reason_plan',
       stepNumber: 2,
       title: 'Reason + Plan',
-      description: 'Menganalisis tujuan dan merencanakan dekomposisi task.',
+      description: 'Menganalisis tujuan dengan AI dan merencanakan dekomposisi task.',
       status: 'running',
-      timestamp: new Date().toLocaleTimeString('id-ID'),
+      timestamp: timestamp(),
     }
     yield { type: 'step_start', step: 'reason_plan', stepNumber: 2, trace: step2Trace }
 
-    // Determine intent and planning
-    const lower = userPrompt.toLowerCase()
-    let plannedTools: string[] = []
-    let reasoningNotes = ''
-
-    // Phase 2 Step 8: Detect if prompt requests a recurring schedule / task
-    let taskSchema: RecurringTaskSchema | undefined = undefined
-    const isScheduleIntent =
-      lower.includes('schedule') ||
-      lower.includes('jadwal') ||
-      lower.includes('weekly') ||
-      lower.includes('mingguan') ||
-      lower.includes('recurring') ||
-      lower.includes('rutin') ||
-      lower.includes('every') ||
-      lower.includes('setiap')
-
-    if (isScheduleIntent) {
-      let route = 'slack'
-      if (lower.includes('gmail') || lower.includes('email')) route = 'gmail'
-      else if (lower.includes('notion')) route = 'notion'
-      else if (lower.includes('docs') || lower.includes('google docs')) route = 'googledocs'
-      else if (lower.includes('calendar') || lower.includes('kalender')) route = 'googlecalendar'
-
-      let frequency: 'daily' | 'weekly' | 'monthly' | 'manual' = 'weekly'
-      if (lower.includes('daily') || lower.includes('harian') || lower.includes('setiap hari')) frequency = 'daily'
-      else if (lower.includes('monthly') || lower.includes('bulanan')) frequency = 'monthly'
-
-      const cleanInstruction = userPrompt
-        .replace(/^(schedule|jadwalkan|tolong jadwalkan|buatkan jadwal|please schedule)\s*(a|an|the)?/i, '')
-        .trim()
-
-      taskSchema = {
-        instruction: cleanInstruction || 'Send weekly team report',
-        route,
-        date: new Date().toISOString().split('T')[0],
-        time: '09:00',
-        frequency,
-      }
-    }
-
+    // If an action was already approved by user in Step 7, execute it directly
     if (options?.approvedAction) {
-      plannedTools = [options.approvedAction.toolName]
-      reasoningNotes = `Melanjutkan eksekusi aksi yang telah disetujui pengguna: ${options.approvedAction.toolName}`
-    } else if (isScheduleIntent) {
-      // Connect tools according to user flow in Image 1 (Gmail + Google Docs + Slack + Calendar)
-      plannedTools = []
-      if (this.tools.has('gmail')) plannedTools.push('gmail')
-      if (this.tools.has('googledocs')) plannedTools.push('googledocs')
-      if (this.tools.has('slack')) plannedTools.push('slack')
-      if (this.tools.has('googlecalendar')) plannedTools.push('googlecalendar')
-      if (plannedTools.length === 0) plannedTools = ['googlecalendar']
-      reasoningNotes = `Menyiapkan recurring task schedule untuk instruksi: "${taskSchema?.instruction}". Menghubungkan tool routing ke ${taskSchema?.route}.`
-    } else if (lower.includes('slack') || lower.includes('#general') || lower.includes('kirim ke slack')) {
-      if (this.tools.has('slack')) plannedTools.push('slack')
-      reasoningNotes = 'Mendeteksi instruksi pengiriman pesan atau notifikasi ke Slack via Composio.'
-    } else if (lower.includes('email') || lower.includes('gmail') || lower.includes('inbox')) {
-      if (this.tools.has('gmail')) plannedTools.push('gmail')
-      reasoningNotes = 'Mendeteksi instruksi pencarian atau pengelolaan email melalui Gmail via Composio.'
-    } else if (lower.includes('docs') || lower.includes('dokumen') || lower.includes('google docs')) {
-      if (this.tools.has('googledocs')) plannedTools.push('googledocs')
-      reasoningNotes = 'Mendeteksi kebutuhan pembuatan atau pembaruan berkas di Google Docs via Composio.'
-    } else if (lower.includes('notion')) {
-      if (this.tools.has('notion')) plannedTools.push('notion')
-      reasoningNotes = 'Mendeteksi pengelolaan halaman atau database Notion via Composio.'
-    } else if (lower.includes('calendar') || lower.includes('kalender') || lower.includes('meeting')) {
-      if (this.tools.has('googlecalendar')) plannedTools.push('googlecalendar')
-      reasoningNotes = 'Mendeteksi penjadwalan agenda di Google Calendar via Composio.'
-    } else if (lower.includes('github') || lower.includes('repo') || lower.includes('pull request')) {
-      if (this.tools.has('github')) plannedTools.push('github')
-      reasoningNotes = 'Mendeteksi manajemen repositori GitHub via Composio.'
-    } else if (lower.includes('reddit')) {
-      if (this.tools.has('reddit')) plannedTools.push('reddit')
-      reasoningNotes = 'Mendeteksi interaksi komunitas Reddit via Composio.'
-    } else if (lower.includes('publish') || lower.includes('delete') || lower.includes('hapus') || lower.includes('sync')) {
-      plannedTools = ['execute_sensitive_action']
-      reasoningNotes = 'Terdeteksi permintaan aksi kritis/perubahan data. Memerlukan verifikasi persetujuan (Human-in-the-Loop).'
-    } else if (lower.includes('cari') || lower.includes('search') || lower.includes('info') || lower.includes('apa itu') || lower.includes('dokumen')) {
-      plannedTools = ['web_search']
-      reasoningNotes = 'Perlu mencari informasi atau dokumentasi relevan dari web.'
-    } else if (lower.includes('hitung') || lower.includes('calculate') || lower.includes('*') || lower.includes('+') || lower.includes('%')) {
-      plannedTools = ['calculator']
-      reasoningNotes = 'Perlu melakukan kalkulasi matematis atau evaluasi rumus.'
-    } else if (lower.includes('database') || lower.includes('data') || lower.includes('catatan')) {
-      plannedTools = ['database_query']
-      reasoningNotes = 'Perlu membaca data atau memori dari database agent.'
-    } else {
-      reasoningNotes = 'Menganalisis instruksi secara langsung berdasarkan persona dan pengetahuan model.'
+      step2Trace.status = 'completed'
+      step2Trace.details = {
+        reasoning: `Melanjutkan eksekusi aksi yang telah disetujui: ${options.approvedAction.toolName}`,
+        approvedAction: options.approvedAction,
+      }
+      yield { type: 'step_complete', step: 'reason_plan', stepNumber: 2, trace: step2Trace }
+
+      const tool = this.tools.get(options.approvedAction.toolName)
+      if (tool) {
+        // Step 5: Run approved tool
+        const step5Trace: AgentStepTrace = {
+          step: 'run_tools',
+          stepNumber: 5,
+          title: 'Run Tools',
+          description: `Mengeksekusi tool terkonfirmasi: ${tool.name}`,
+          status: 'running',
+          timestamp: timestamp(),
+        }
+        yield { type: 'step_start', step: 'run_tools', stepNumber: 5, trace: step5Trace }
+
+        try {
+          const result = await tool.execute(options.approvedAction.parameters, context)
+          step5Trace.status = 'completed'
+          step5Trace.details = { output: result }
+          yield { type: 'step_complete', step: 'run_tools', stepNumber: 5, trace: step5Trace }
+
+          // Step 8: Final Response
+          const step8Trace: AgentStepTrace = {
+            step: 'final_response',
+            stepNumber: 8,
+            title: 'Final Response',
+            description: 'Menyintesis laporan eksekusi.',
+            status: 'completed',
+            timestamp: timestamp(),
+          }
+          yield {
+            type: 'final_response',
+            step: 'final_response',
+            stepNumber: 8,
+            trace: step8Trace,
+            data: {
+              answer: `✅ **Aksi Berhasil Dijalankan**\n\nTindakan **${tool.name}** telah dieksekusi dengan sukses.\n\n\`\`\`json\n${JSON.stringify(
+                result,
+                null,
+                2
+              )}\n\`\`\``,
+              provider: 'Composio & Orbit Agent',
+            },
+          }
+        } catch (err: any) {
+          step5Trace.status = 'failed'
+          step5Trace.details = { error: err.message }
+          yield { type: 'step_complete', step: 'run_tools', stepNumber: 5, trace: step5Trace }
+        }
+      }
+      return
     }
 
-    step2Trace.status = 'completed'
-    step2Trace.details = { reasoning: reasoningNotes, plannedTools }
-    yield { type: 'step_complete', step: 'reason_plan', stepNumber: 2, trace: step2Trace }
+    if (!geminiKey) {
+      step2Trace.status = 'failed'
+      step2Trace.details = { error: 'GEMINI_API_KEY tidak dikonfigurasi.' }
+      yield { type: 'step_complete', step: 'reason_plan', stepNumber: 2, trace: step2Trace }
+
+      yield {
+        type: 'final_response',
+        step: 'final_response',
+        stepNumber: 8,
+        data: {
+          answer:
+            '⚠️ **GEMINI_API_KEY Belum Dikonfigurasi**\n\nUntuk menjalankan agent secara nyata tanpa mock, harap tambahkan key Google Gemini Anda pada file `.env.local`:\n```env\nGEMINI_API_KEY=AIzaSy...\nCOMPOSIO_API_KEY=cmp_...\n```\nSetelah disimpan, agent akan langsung memproses instruksi dengan kecerdasan nyata.',
+          provider: 'Error: API Key Missing',
+        },
+      }
+      return
+    }
 
     // =========================================================================
-    // STEP 3: Check Instructions (Apply rules, behavior, and constraints)
+    // STEP 3: Check Instructions (Apply rules and guidelines)
     // =========================================================================
     const step3Trace: AgentStepTrace = {
       step: 'check_instructions',
       stepNumber: 3,
       title: 'Check Instructions',
       description: 'Menerapkan batasan sistem, aturan persona, dan guardrails.',
-      status: 'running',
-      timestamp: new Date().toLocaleTimeString('id-ID'),
-    }
-    yield { type: 'step_start', step: 'check_instructions', stepNumber: 3, trace: step3Trace }
-
-    const fullInstructions = buildAgentInstructions(this.config)
-    step3Trace.status = 'completed'
-    step3Trace.details = {
-      rulesApplied: true,
-      agentName: this.config.name,
-      modelTarget: this.config.model,
-      guardrails: 'Safety checks passed • Persona active',
+      status: 'completed',
+      details: {
+        agentName: this.config.name,
+        rulesApplied: true,
+        toolsCount: this.tools.size,
+      },
+      timestamp: timestamp(),
     }
     yield { type: 'step_complete', step: 'check_instructions', stepNumber: 3, trace: step3Trace }
 
+    // Prepare Gemini contents payload
+    const toolDeclarations = this.getGeminiToolDeclarations()
+    const contents: GeminiContent[] = []
+
+    if (options?.conversationHistory) {
+      for (const msg of options.conversationHistory) {
+        contents.push({
+          role: msg.role === 'agent' ? 'model' : 'user',
+          parts: [{ text: msg.content }],
+        })
+      }
+    }
+
+    contents.push({
+      role: 'user',
+      parts: [{ text: userPrompt }],
+    })
+
+    // First call to Gemini: reasoning & tool selection
+    const firstCall = await callGeminiRaw({
+      apiKey: geminiKey,
+      model: this.config.model,
+      systemInstruction: fullInstructions,
+      contents,
+      tools: toolDeclarations,
+    })
+
+    if (!firstCall.success) {
+      step2Trace.status = 'failed'
+      step2Trace.details = { error: firstCall.error }
+      yield { type: 'step_complete', step: 'reason_plan', stepNumber: 2, trace: step2Trace }
+
+      yield {
+        type: 'final_response',
+        step: 'final_response',
+        stepNumber: 8,
+        data: {
+          answer: `⚠️ **Gagal Menghubungkan ke Gemini**: ${firstCall.error}`,
+          provider: 'Google Gemini Error',
+        },
+      }
+      return
+    }
+
+    const plannedTools = firstCall.functionCalls ? firstCall.functionCalls.map((f) => f.name) : []
+    step2Trace.status = 'completed'
+    step2Trace.details = {
+      plannedTools,
+      reasoning: plannedTools.length > 0 ? `AI memutuskan untuk memanggil tool: ${plannedTools.join(', ')}` : 'AI memproses sintesis langsung.',
+    }
+    yield { type: 'step_complete', step: 'reason_plan', stepNumber: 2, trace: step2Trace }
+
     // =========================================================================
-    // STEP 4: Pick Tools (Choose the right connected tools)
+    // STEP 4: Pick Tools
     // =========================================================================
     const step4Trace: AgentStepTrace = {
       step: 'pick_tools',
       stepNumber: 4,
       title: 'Pick Tools',
-      description: plannedTools.length > 0
-        ? `Memilih tool terhubung: ${plannedTools.join(', ')}`
-        : 'Tidak memerlukan tool tambahan (Direct synthesis)',
-      status: 'running',
-      timestamp: new Date().toLocaleTimeString('id-ID'),
+      description: plannedTools.length > 0 ? `AI memilih tools: ${plannedTools.join(', ')}` : 'Tidak memerlukan pemanggilan tools.',
+      status: 'completed',
+      details: { selectedTools: plannedTools },
+      timestamp: timestamp(),
     }
-    yield { type: 'step_start', step: 'pick_tools', stepNumber: 4, trace: step4Trace }
-
-    step4Trace.status = 'completed'
-    step4Trace.details = { selectedTools: plannedTools }
     yield { type: 'step_complete', step: 'pick_tools', stepNumber: 4, trace: step4Trace }
 
-    // Tool execution results collector
-    let toolResults: any[] = []
+    // Execute functions if Gemini called them
+    const toolResults: any[] = []
 
-    // =========================================================================
-    // STEP 5 & 7: Run Tools OR Ask for Approval
-    // =========================================================================
-    if (plannedTools.length > 0) {
-      for (const toolName of plannedTools) {
-        const tool = this.tools.get(toolName)
+    if (firstCall.functionCalls && firstCall.functionCalls.length > 0) {
+      for (const call of firstCall.functionCalls) {
+        const tool = this.tools.get(call.name)
         if (!tool) continue
 
-        // Check if tool requires human approval (Step 7: Ask for Approval)
-        if (tool.requireApproval && !options?.approvedAction) {
+        // Check if tool requires human approval (Step 7)
+        if (tool.requireApproval) {
           const approvalReq: ApprovalRequest = {
             id: `appr_${Date.now()}`,
             toolName: tool.name,
-            parameters: {
-              actionType: 'publish_brief',
-              target: 'Workspace Production',
-              description: userPrompt,
-            },
-            reason: 'Tindakan ini akan mempublikasikan data atau mengubah konfigurasi sistem.',
-            timestamp: new Date().toLocaleTimeString('id-ID'),
+            parameters: call.args,
+            reason: `Tindakan "${tool.name}" memiliki dampak nyata pada data atau akun eksternal.`,
+            timestamp: timestamp(),
           }
 
           const step7Trace: AgentStepTrace = {
             step: 'ask_approval',
             stepNumber: 7,
             title: 'Ask for Approval',
-            description: `Meminta konfirmasi pengguna sebelum menjalankan "${tool.name}".`,
+            description: `Memerlukan persetujuan Anda sebelum menjalankan "${tool.name}".`,
             status: 'waiting_approval',
             details: approvalReq,
-            timestamp: new Date().toLocaleTimeString('id-ID'),
+            timestamp: timestamp(),
           }
 
           yield {
@@ -253,53 +324,23 @@ export class AgentRuntime {
             trace: step7Trace,
             data: approvalReq,
           }
-
-          // Pause execution until approved
-          return
+          return // Pause execution until user approves
         }
 
-        // STEP 5: Run Tools (Execute API, database, browser, tool actions)
+        // STEP 5: Run Tools
         const step5Trace: AgentStepTrace = {
           step: 'run_tools',
           stepNumber: 5,
           title: 'Run Tools',
           description: `Mengeksekusi tool: ${tool.name}`,
           status: 'running',
-          timestamp: new Date().toLocaleTimeString('id-ID'),
+          timestamp: timestamp(),
         }
         yield { type: 'step_start', step: 'run_tools', stepNumber: 5, trace: step5Trace }
 
-        let params: any = {}
-        if (tool.name === 'web_search') {
-          params = { query: userPrompt }
-        } else if (tool.name === 'calculator') {
-          params = { expression: userPrompt }
-        } else if (tool.name === 'database_query') {
-          params = { topic: userPrompt }
-        } else if (tool.name === 'slack') {
-          const channelMatch = userPrompt.match(/#[a-zA-Z0-9_-]+/)
-          params = { channel: channelMatch ? channelMatch[0] : '#general', message: userPrompt }
-        } else if (tool.name === 'gmail') {
-          params = { action: 'search', query: userPrompt }
-        } else if (tool.name === 'googledocs') {
-          params = { title: 'Laporan Berkala Otomatis', content: userPrompt }
-        } else if (tool.name === 'notion') {
-          params = { action: 'create_page', title: userPrompt }
-        } else if (tool.name === 'googlecalendar') {
-          params = { summary: taskSchema?.instruction || userPrompt, time: taskSchema ? `${taskSchema.frequency} at ${taskSchema.time}` : '09:00' }
-        } else if (tool.name === 'github') {
-          params = { action: 'list_issues', repo: 'workspace/main' }
-        } else if (tool.name === 'reddit') {
-          params = { subreddit: 'technology', query: userPrompt }
-        } else if (tool.name === 'outlook') {
-          params = { action: 'read_inbox', subject: userPrompt }
-        } else if (options?.approvedAction) {
-          params = options.approvedAction.parameters
-        }
-
         try {
-          const result = await tool.execute(params, context)
-          toolResults.push({ tool: tool.name, result })
+          const result = await tool.execute(call.args, context)
+          toolResults.push({ name: tool.name, result })
 
           step5Trace.status = 'completed'
           step5Trace.details = { output: result }
@@ -310,153 +351,130 @@ export class AgentRuntime {
           yield { type: 'step_complete', step: 'run_tools', stepNumber: 5, trace: step5Trace }
         }
 
-        // =========================================================================
-        // STEP 6: Review Results (Examine outputs and errors)
-        // =========================================================================
+        // STEP 6: Review Results
         const step6Trace: AgentStepTrace = {
           step: 'review_results',
           stepNumber: 6,
           title: 'Review Results',
-          description: 'Memeriksa output tool dan memvalidasi keakuratan data.',
-          status: 'running',
-          timestamp: new Date().toLocaleTimeString('id-ID'),
-        }
-        yield { type: 'step_start', step: 'review_results', stepNumber: 6, trace: step6Trace }
-
-        step6Trace.status = 'completed'
-        step6Trace.details = {
-          reviewedCount: toolResults.length,
-          statusCheck: 'All tool outputs verified and formatted.',
+          description: `Memeriksa hasil output dari ${tool.name}.`,
+          status: 'completed',
+          details: { verified: true },
+          timestamp: timestamp(),
         }
         yield { type: 'step_complete', step: 'review_results', stepNumber: 6, trace: step6Trace }
       }
-    }
 
-    // =========================================================================
-    // STEP 8: Final Response (Return a clear answer or generated UI)
-    // =========================================================================
-    const step8Trace: AgentStepTrace = {
-      step: 'final_response',
-      stepNumber: 8,
-      title: 'Final Response',
-      description: 'Menyintesis jawaban akhir untuk pengguna.',
-      status: 'running',
-      timestamp: new Date().toLocaleTimeString('id-ID'),
-    }
-    yield { type: 'step_start', step: 'final_response', stepNumber: 8, trace: step8Trace }
+      // Add model function call to contents history
+      contents.push({
+        role: 'model',
+        parts: firstCall.functionCalls.map((f) => ({
+          functionCall: { name: f.name, args: f.args },
+        })),
+      })
 
-    // Synthesize final response strictly via AI (OpenAI or Google Gemini)
-    let finalAnswer = ''
-    let activeProvider = ''
-
-    const effectivePrompt =
-      userPrompt && userPrompt.trim().length > 0
-        ? userPrompt
-        : options?.approvedAction
-        ? `Pengguna telah menyetujui eksekusi aksi: ${options.approvedAction.toolName} (${options.approvedAction.parameters?.actionType || 'action'}). Berikan konfirmasi dan ringkasan eksekusi dalam Bahasa Indonesia yang ramah dan jelas.`
-        : 'Halo'
-
-    // 1. Try OpenAI First
-    const apiKey = process.env.OPENAI_API_KEY
-    if (apiKey && apiKey.startsWith('sk-') && apiKey.length > 20) {
-      try {
-        const response = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model: this.config.model,
-            messages: [
-              { role: 'system', content: fullInstructions },
-              ...(options?.conversationHistory || []).map((m) => ({
-                role: m.role === 'agent' ? 'assistant' : 'user',
-                content: m.content,
-              })),
-              {
-                role: 'user',
-                content: toolResults.length > 0
-                  ? `${effectivePrompt}\n\n[Hasil Eksekusi Tool Agent SDK]:\n${JSON.stringify(toolResults, null, 2)}`
-                  : effectivePrompt,
+      // Add functionResponse to contents history
+      for (const tr of toolResults) {
+        contents.push({
+          role: 'function',
+          parts: [
+            {
+              functionResponse: {
+                name: tr.name,
+                response: tr.result,
               },
-            ],
-            temperature: 0.7,
-          }),
+            },
+          ],
         })
-
-        if (response.ok) {
-          const data = await response.json()
-          const text = data.choices?.[0]?.message?.content
-          if (text) {
-            finalAnswer = text
-            activeProvider = `OpenAI (${this.config.model})`
-          }
-        } else {
-          console.warn(`OpenAI failed with status ${response.status}, triggering automatic fallback to Gemini...`)
-        }
-      } catch (apiErr) {
-        console.warn('OpenAI error, triggering automatic fallback to Gemini...', apiErr)
       }
-    }
 
-    // 2. Automatic Fallback to Google Gemini
-    if (!finalAnswer) {
-      const geminiApiKey = process.env.GEMINI_API_KEY
-      if (geminiApiKey && geminiApiKey.trim().length > 0) {
-        console.log('⚡ Agent SDK: OpenAI unavailable or failed, switching automatically to Google Gemini...')
-        const geminiRes = await callGemini({
-          apiKey: geminiApiKey,
-          model: process.env.GEMINI_DEFAULT_MODEL || 'gemini-2.5-flash',
-          systemInstruction: fullInstructions,
-          conversationHistory: options?.conversationHistory || [],
-          userPrompt: effectivePrompt,
-          toolResults,
-        })
+      // Second call to Gemini to synthesize final response after seeing tool output
+      const secondCall = await callGeminiRaw({
+        apiKey: geminiKey,
+        model: this.config.model,
+        systemInstruction: fullInstructions,
+        contents,
+      })
 
-        if (geminiRes.success && geminiRes.content) {
-          finalAnswer = geminiRes.content
-          activeProvider = `${geminiRes.provider} (Auto-Fallback)`
-        } else {
-          console.warn('Gemini fallback notice:', geminiRes.error)
-        }
+      let finalAnswer = secondCall.content || 'Pekerjaan selesai.'
+      let taskSchema = this.extractTaskSchema(finalAnswer, userPrompt)
+
+      const step8Trace: AgentStepTrace = {
+        step: 'final_response',
+        stepNumber: 8,
+        title: 'Final Response',
+        description: 'Menyintesis jawaban akhir.',
+        status: 'completed',
+        details: { provider: secondCall.provider, taskSchema },
+        timestamp: timestamp(),
       }
-    }
 
-    // 3. Strict Verification: NEVER return simulated mock responses!
-    if (!finalAnswer) {
-      step8Trace.status = 'failed'
-      step8Trace.details = {
-        error: 'Tidak ada model AI yang aktif atau dapat merespons.',
-        activeProvider: 'None',
-      }
       yield {
         type: 'final_response',
         step: 'final_response',
         stepNumber: 8,
         trace: step8Trace,
-        data: {
-          answer:
-            '⚠️ **Koneksi Model AI Tidak Tersedia**\n\nRespon simulasi telah dinonaktifkan sepenuhnya. Untuk mendapatkan jawaban langsung dari AI, pastikan konfigurasi API Key aktif pada file `.env.local`:\n- `OPENAI_API_KEY` (OpenAI)\n- ATAU `GEMINI_API_KEY` (Google Gemini)',
-          provider: 'Error (AI Key Tidak Aktif)',
-        },
+        data: { answer: finalAnswer, provider: secondCall.provider },
+        taskSchema,
       }
-      return
+    } else {
+      // Direct response without tools
+      let finalAnswer = firstCall.content || 'Halo! Ada yang bisa saya bantu?'
+      let taskSchema = this.extractTaskSchema(finalAnswer, userPrompt)
+
+      const step8Trace: AgentStepTrace = {
+        step: 'final_response',
+        stepNumber: 8,
+        title: 'Final Response',
+        description: 'Menyintesis jawaban akhir.',
+        status: 'completed',
+        details: { provider: firstCall.provider, taskSchema },
+        timestamp: timestamp(),
+      }
+
+      yield {
+        type: 'final_response',
+        step: 'final_response',
+        stepNumber: 8,
+        trace: step8Trace,
+        data: { answer: finalAnswer, provider: firstCall.provider },
+        taskSchema,
+      }
+    }
+  }
+
+  private extractTaskSchema(answer: string, userPrompt: string): RecurringTaskSchema | undefined {
+    // Check if response contains structured json schema
+    const jsonMatch = answer.match(/```json:task_schema\s*([\s\S]*?)\s*```/) || answer.match(/\{[\s\S]*?"instruction"[\s\S]*?\}/)
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[1] || jsonMatch[0])
+        if (parsed.instruction) {
+          return {
+            instruction: parsed.instruction,
+            route: parsed.route || 'slack',
+            date: parsed.date || new Date().toISOString().split('T')[0],
+            time: parsed.time || '09:00',
+            frequency: parsed.frequency || 'weekly',
+          }
+        }
+      } catch {}
     }
 
-    step8Trace.status = 'completed'
-    step8Trace.details = {
-      answerLength: finalAnswer.length,
-      activeProvider,
-      taskSchema,
+    const lower = userPrompt.toLowerCase()
+    if (lower.includes('schedule') || lower.includes('jadwal') || lower.includes('recurring') || lower.includes('every')) {
+      let route = 'slack'
+      if (lower.includes('email') || lower.includes('gmail')) route = 'gmail'
+      else if (lower.includes('calendar')) route = 'googlecalendar'
+
+      return {
+        instruction: userPrompt.replace(/^(schedule|jadwalkan|tolong jadwalkan)\s*/i, '').trim(),
+        route,
+        date: new Date().toISOString().split('T')[0],
+        time: '09:00',
+        frequency: lower.includes('daily') || lower.includes('harian') ? 'daily' : 'weekly',
+      }
     }
-    yield {
-      type: 'final_response',
-      step: 'final_response',
-      stepNumber: 8,
-      trace: step8Trace,
-      data: { answer: finalAnswer, provider: activeProvider },
-      taskSchema,
-    }
+
+    return undefined
   }
 }

@@ -11,17 +11,21 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'userPrompt is required' }, { status: 400 })
     }
 
-    // Connect to Supabase to fetch agent configuration
+    // Connect to Supabase to fetch agent configuration and user
     const supabase = await createClient()
+    const {
+      data: { user },
+    } = await supabase.auth.getUser()
+
     const { data: agentData } = await supabase
       .from('agents')
       .select('*')
       .eq('id', agentId)
       .single()
 
-    const agentName = agentData?.name || 'OpenAI Agent'
+    const agentName = agentData?.name || 'Orbit Agent'
     const agentInstructions = agentData?.system_prompt || agentData?.description || ''
-    const agentModel = agentData?.model || body.model || process.env.OPENAI_DEFAULT_MODEL || 'gpt-4o-mini'
+    const agentModel = agentData?.model || body.model || process.env.GEMINI_DEFAULT_MODEL || 'gemini-2.5-flash'
     const connectedTools = agentData?.tools || body.connectedTools || []
     const composioSessionId = agentData?.composio_session_id || body.composioSessionId || null
 
@@ -40,6 +44,7 @@ export async function POST(req: NextRequest) {
       async start(controller) {
         try {
           const generator = runtime.execute(userPrompt || '', {
+            userId: user?.id || user?.email || 'default_user',
             conversationHistory: conversationHistory || [],
             approvedAction: approvedAction || null,
           })
