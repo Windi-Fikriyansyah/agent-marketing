@@ -8,6 +8,7 @@ import {
 } from './types'
 import { DEFAULT_AGENT_TOOLS } from './tools/builtins'
 import { COMPOSIO_APP_TOOLS } from './tools/composioTools'
+import { BROWSER_TOOLS } from '@/lib/browser/tools'
 import { buildAgentInstructions } from './instructions'
 import { streamOpenRouterTurn } from './providers/openrouter'
 import { composioService } from '@/lib/composio/client'
@@ -58,6 +59,39 @@ function isActionRequiringApproval(toolName: string, args: Record<string, any>):
     return {
       requires: true,
       reason: `Agent ingin membuat halaman catatan baru di Notion berjudul "${args.title}".`,
+    }
+  }
+
+  if (toolName === 'browser_act') {
+    const instr = (args?.instruction || '').toLowerCase()
+    const sensitiveKeywords = [
+      'submit',
+      'kirim',
+      'bayar',
+      'pay',
+      'checkout',
+      'beli',
+      'order',
+      'pesan',
+      'delete',
+      'hapus',
+      'login',
+      'masuk',
+      'sign in',
+      'password',
+      'sandi',
+      'kata sandi',
+      'daftar',
+      'register',
+      'sign up',
+      'transfer',
+    ]
+    const isSensitive = sensitiveKeywords.some((k) => instr.includes(k))
+    if (isSensitive) {
+      return {
+        requires: true,
+        reason: `Agent meminta persetujuan untuk melakukan aksi browser interaktif sensitif: "${args.instruction}". Konfirmasi diperlukan sebelum mengeksekusi di browser.`,
+      }
     }
   }
 
@@ -115,6 +149,9 @@ export class AgentRuntime {
 
     // Attach Composio App Tools
     COMPOSIO_APP_TOOLS.forEach((t) => this.tools.set(t.name, t))
+
+    // Attach Cloud Browser Tools (Browserbase + Stagehand)
+    BROWSER_TOOLS.forEach((t) => this.tools.set(t.name, t))
   }
 
   /**
@@ -156,11 +193,18 @@ export class AgentRuntime {
       console.warn('[AgentRuntime] Composio session setup warning:', err.message)
     }
 
+    let liveViewUpdate: { url: string; sessionId: string } | null = null
+
     const context: AgentExecutionContext = {
       userId: activeUserId,
+      conversationId: this.config.conversationId,
       sessionId: composioSessionId || undefined,
       agentId: this.config.agentId,
       composioSession,
+      model: this.config.model,
+      onLiveViewUrl: (url, sid) => {
+        liveViewUpdate = { url, sessionId: sid }
+      },
     }
 
     // =========================================================================
@@ -239,10 +283,19 @@ export class AgentRuntime {
     // Prepare tools list for LLM function calling
     const availableToolsList = Array.from(this.tools.values())
 
+    // In-memory set of executed approval IDs for idempotency (AGENTS.md §F)
+    const executedApprovalIds = (globalThis as any).__executedApprovalIds || ((globalThis as any).__executedApprovalIds = new Set<string>())
+
     // If an action was already approved by user in UI (Human-In-The-Loop resume)
     if (options?.approvedAction) {
       const tool = this.tools.get(options.approvedAction.toolName)
-      if (tool) {
+      const approvalId =
+        (options.approvedAction as any).id ||
+        (options.approvedAction as any).idempotencyKey ||
+        `${options.approvedAction.toolName}_${JSON.stringify(options.approvedAction.parameters)}`
+
+      if (tool && !executedApprovalIds.has(approvalId)) {
+        executedApprovalIds.add(approvalId)
         yield {
           type: 'step_start',
           step: 'run_tools',
@@ -431,6 +484,23 @@ export class AgentRuntime {
                     message: toolExecutionResult.message,
                   },
                 }
+              }
+
+              // Check if tool produced a live view url (browser_navigate / browser_act)
+              const liveViewObj = liveViewUpdate as { url: string; sessionId: string } | null
+              if (toolExecutionResult?.liveViewUrl || liveViewObj) {
+                const lvw = toolExecutionResult?.liveViewUrl || liveViewObj?.url
+                const sid = toolExecutionResult?.sessionId || liveViewObj?.sessionId
+                yield {
+                  type: 'browser_live_view',
+                  data: {
+                    debuggerUrl: lvw,
+                    sessionId: sid,
+                    currentUrl: toolExecutionResult?.currentUrl,
+                    title: toolExecutionResult?.title,
+                  },
+                }
+                liveViewUpdate = null
               }
             } catch (execErr: any) {
               step5Trace.status = 'failed'

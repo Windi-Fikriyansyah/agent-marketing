@@ -38,6 +38,8 @@ import {
   Pause,
   Play,
   RotateCcw,
+  Globe,
+  ExternalLink,
 } from 'lucide-react'
 import { AgentStepTrace, ApprovalRequest, RecurringTaskSchema } from '@/lib/agent-sdk/types'
 import { buildAgentInstructions } from '@/lib/agent-sdk/instructions'
@@ -245,7 +247,36 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
   const [description, setDescription] = useState('')
   const [instructions, setInstructions] = useState('')
   const [avatarString, setAvatarString] = useState('orange-circle-happy')
-  const [activeTab, setActiveTab] = useState<'settings' | 'tools' | 'schedule' | 'agent_settings'>('settings')
+  const [activeTab, setActiveTab] = useState<'settings' | 'tools' | 'schedule' | 'agent_settings' | 'browser'>('settings')
+
+  // Cloud Browser Live View state (Browserbase + Stagehand v4)
+  const [activeBrowser, setActiveBrowser] = useState<{
+    sessionId: string
+    debuggerUrl: string
+    currentUrl?: string
+    title?: string
+    isActive: boolean
+  } | null>(null)
+  const [closingBrowser, setClosingBrowser] = useState(false)
+
+  const handleCloseBrowser = async () => {
+    setClosingBrowser(true)
+    try {
+      const res = await fetch('/api/browser/live', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: user?.id || user?.email }),
+      })
+      const data = await res.json()
+      if (data.success) {
+        setActiveBrowser(null)
+      }
+    } catch (err) {
+      console.warn('Gagal menutup sesi browser:', err)
+    } finally {
+      setClosingBrowser(false)
+    }
+  }
 
   // Tools Tab state (Strictly from Database, no dummy data)
   const [toolsList, setToolsList] = useState<ToolItem[]>([])
@@ -283,6 +314,23 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
     }
     loadModels()
   }, [])
+
+  // Poll / check active cloud browser session on mount or user change
+  useEffect(() => {
+    if (!user) return
+    fetch(`/api/browser/live?userId=${encodeURIComponent(user.id || user.email || '')}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.active && data.debuggerUrl) {
+          setActiveBrowser({
+            sessionId: data.sessionId,
+            debuggerUrl: data.debuggerUrl,
+            isActive: true,
+          })
+        }
+      })
+      .catch(() => {})
+  }, [user])
 
   const handleModelChange = async (newModelId: string) => {
     setModelName(newModelId)
@@ -719,6 +767,18 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                     traces,
                     toolCards: newCards,
                   }
+                }
+
+                if (event.type === 'browser_live_view') {
+                  const bData = event.data || {}
+                  setActiveBrowser({
+                    sessionId: bData.sessionId,
+                    debuggerUrl: bData.debuggerUrl,
+                    currentUrl: bData.currentUrl,
+                    title: bData.title,
+                    isActive: true,
+                  })
+                  setActiveTab('browser')
                 }
 
                 if (event.type === 'error') {
@@ -1926,6 +1986,23 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
               >
                 <Settings className="w-4 h-4" />
               </button>
+
+              {/* Tab 5: Cloud Browser (Globe) with Live Indicator */}
+              <button
+                type="button"
+                onClick={() => setActiveTab('browser')}
+                className={`flex-1 pb-2.5 transition-colors cursor-pointer border-b-2 -mb-[1px] flex justify-center relative ${
+                  activeTab === 'browser'
+                    ? 'border-blue-600 text-blue-600 font-bold'
+                    : 'border-transparent text-slate-400 hover:text-slate-600'
+                }`}
+                title="Cloud Browser - Stagehand & Browserbase Live View"
+              >
+                <Globe className="w-4 h-4" />
+                {activeBrowser?.isActive && (
+                  <span className="absolute top-1 right-2 w-2 h-2 rounded-full bg-emerald-500 ring-2 ring-white animate-pulse" />
+                )}
+              </button>
             </div>
 
             {/* TAB 1: Settings Tab (Agent Configuration Panel from Image 1) */}
@@ -2607,6 +2684,145 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                     <span>{deleting ? 'Menghapus...' : 'Delete Agent'}</span>
                   </button>
                 </div>
+              </div>
+            )}
+
+            {/* TAB 5: Cloud Browser Live View (Browserbase + Stagehand v4) */}
+            {activeTab === 'browser' && (
+              <div className="space-y-4 animate-in fade-in duration-150">
+                {/* Browser Status & Actions Bar */}
+                <div className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/80 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-blue-600 flex items-center justify-center">
+                        <span className={`w-1.5 h-1.5 rounded-full ${activeBrowser?.isActive ? 'bg-emerald-400 animate-ping' : 'bg-slate-300'}`} />
+                      </span>
+                      <span className="text-xs font-bold text-slate-900">
+                        {activeBrowser?.isActive ? 'Cloud Browser Active' : 'Browser Cloud Standby'}
+                      </span>
+                    </div>
+
+                    {activeBrowser?.isActive && (
+                      <button
+                        type="button"
+                        onClick={handleCloseBrowser}
+                        disabled={closingBrowser}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-[11px] font-semibold transition-all cursor-pointer shadow-2xs disabled:opacity-50"
+                        title="Tutup sesi browser cloud dan lepaskan sumber daya Browserbase"
+                      >
+                        <Trash2 className="w-3 h-3 text-rose-600" />
+                        <span>{closingBrowser ? 'Menutup...' : 'Tutup Browser'}</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Active URL & Inspector Info */}
+                  {activeBrowser?.isActive ? (
+                    <div className="space-y-2 pt-1">
+                      {activeBrowser.currentUrl && (
+                        <div className="flex items-center gap-2 px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-mono text-slate-700 min-w-0">
+                          <Globe className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                          <span className="truncate flex-1" title={activeBrowser.currentUrl}>
+                            {activeBrowser.currentUrl}
+                          </span>
+                          <a
+                            href={activeBrowser.currentUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-slate-400 hover:text-blue-600 shrink-0"
+                            title="Buka URL asli di tab baru"
+                          >
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                        </div>
+                      )}
+
+                      <div className="flex items-center justify-between text-[11px] text-slate-500 pt-0.5">
+                        <span className="truncate font-mono">
+                          ID: {activeBrowser.sessionId.substring(0, 12)}...
+                        </span>
+                        <a
+                          href={`https://www.browserbase.com/sessions/${activeBrowser.sessionId}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-700 font-medium"
+                        >
+                          <span>Session Inspector</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-slate-500 leading-relaxed">
+                      Sesi browser cloud akan otomatis diluncurkan saat Anda meminta agen untuk membuka web, memeriksa halaman, atau mengekstrak data.
+                    </p>
+                  )}
+                </div>
+
+                {/* Embedded Live View Iframe */}
+                {activeBrowser?.debuggerUrl ? (
+                  <div className="rounded-xl overflow-hidden border border-slate-200 shadow-sm bg-slate-900">
+                    <div className="px-3 py-1.5 bg-slate-800 text-slate-200 text-[10px] font-mono flex items-center justify-between border-b border-slate-700">
+                      <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1">
+                          <span className="w-2 h-2 rounded-full bg-red-400 inline-block" />
+                          <span className="w-2 h-2 rounded-full bg-yellow-400 inline-block" />
+                          <span className="w-2 h-2 rounded-full bg-green-400 inline-block" />
+                        </div>
+                        <span>Browserbase Live View (Interactive)</span>
+                      </div>
+                      <span className="text-emerald-400 font-semibold">● Connected</span>
+                    </div>
+                    <iframe
+                      src={activeBrowser.debuggerUrl}
+                      title="Browserbase Cloud Live View"
+                      className="w-full h-[450px] border-0 bg-white"
+                      allow="clipboard-read; clipboard-write"
+                    />
+                  </div>
+                ) : (
+                  <div className="p-6 rounded-2xl border border-dashed border-slate-300 bg-slate-50/60 text-center space-y-3">
+                    <div className="w-12 h-12 rounded-2xl bg-blue-50 border border-blue-100 text-blue-600 flex items-center justify-center mx-auto shadow-2xs">
+                      <Globe className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <h4 className="text-xs font-bold text-slate-900">
+                        Browser Cloud (Stagehand v4 + Browserbase)
+                      </h4>
+                      <p className="text-[11px] text-slate-500 max-w-xs mx-auto mt-1 leading-relaxed">
+                        Agent memiliki tool browser nyata untuk navigasi, observasi elemen via AI vision, aksi interaktif, dan ekstraksi data.
+                      </p>
+                    </div>
+
+                    <div className="pt-2">
+                      <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-2">
+                        Contoh Perintah Web:
+                      </span>
+                      <div className="space-y-1.5 text-left">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setChatInput('Buka https://news.ycombinator.com dan ambil 3 berita teratas')
+                            if (chatInputRef.current) chatInputRef.current.focus()
+                          }}
+                          className="w-full text-left p-2 rounded-lg bg-white hover:bg-blue-50/50 border border-slate-200 hover:border-blue-200 text-[11px] text-slate-700 transition-all cursor-pointer shadow-2xs"
+                        >
+                          🌐 &quot;Buka news.ycombinator.com dan ambil 3 berita teratas&quot;
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setChatInput('Kunjungi https://news.ycombinator.com lalu amati elemen interaktif yang tersedia')
+                            if (chatInputRef.current) chatInputRef.current.focus()
+                          }}
+                          className="w-full text-left p-2 rounded-lg bg-white hover:bg-blue-50/50 border border-slate-200 hover:border-blue-200 text-[11px] text-slate-700 transition-all cursor-pointer shadow-2xs"
+                        >
+                          🔍 &quot;Kunjungi situs dan amati elemen interaktif yang ada&quot;
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>

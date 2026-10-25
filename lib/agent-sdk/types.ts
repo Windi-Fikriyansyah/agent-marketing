@@ -40,6 +40,8 @@ export interface AgentExecutionContext {
   conversationId?: string
   sessionId?: string
   composioSession?: any
+  model?: string
+  onLiveViewUrl?: (url: string, sessionId: string) => void
 }
 
 export interface AgentToolDefinition {
@@ -69,6 +71,7 @@ export interface AgentRuntimeConfig {
   composioSessionId?: string | null
   connectedTools?: string[]
   userId?: string
+  conversationId?: string
 }
 
 export interface AgentStreamEvent {
@@ -78,6 +81,7 @@ export interface AgentStreamEvent {
     | 'step_complete'
     | 'approval_required'
     | 'connect_required'
+    | 'browser_live_view'
     | 'token'
     | 'final_response'
     | 'error'

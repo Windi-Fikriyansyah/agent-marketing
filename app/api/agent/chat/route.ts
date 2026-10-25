@@ -4,6 +4,8 @@ import { AgentRuntime, resolveEffectiveModel } from '@/lib/agent-sdk/runtime'
 import { validateAgentModel } from '@/lib/agent-sdk/models/catalog'
 import { composioService } from '@/lib/composio/client'
 
+export const maxDuration = 120
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
@@ -70,6 +72,7 @@ export async function POST(req: NextRequest) {
       model: agentModel,
       composioSessionId,
       userId: effectiveUserId,
+      conversationId: body.conversationId || undefined,
       connectedTools: rawTools,
     })
 
