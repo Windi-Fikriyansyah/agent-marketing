@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { composio } from '@/lib/composio/client'
+import { composioService } from '@/lib/composio/client'
 
 export async function GET(req: NextRequest) {
   try {
@@ -9,39 +9,60 @@ export async function GET(req: NextRequest) {
     const userIdParam = searchParams.get('userId')
     const agentId = searchParams.get('agentId')
 
-    let userEmail: string | undefined = undefined
+    let effectiveUserId = userIdParam || 'default_user'
     try {
       const supabase = await createClient()
       const {
         data: { user },
       } = await supabase.auth.getUser()
-      userEmail = user?.email || undefined
-    } catch {
-      // Continue without user
-    }
+      if (user?.id || user?.email) {
+        effectiveUserId = user.id || user.email || 'default_user'
+      }
+    } catch {}
 
-    const userIdsToCheck: string[] = []
-    if (userEmail) userIdsToCheck.push(userEmail)
-    if (userIdParam && !userIdsToCheck.includes(userIdParam)) userIdsToCheck.push(userIdParam)
-    if (agentId && !userIdsToCheck.includes(agentId)) userIdsToCheck.push(agentId)
-    if (userIdsToCheck.length === 0) {
-      userIdsToCheck.push('default_user')
-    }
+    const session = await composioService.getOrCreateSession(effectiveUserId)
+    const toolkits = await composioService.getSessionToolkits(session)
 
-    // If a specific toolkit is requested to verify
     if (toolkit) {
-      const result = await composio.isAccountConnected(toolkit, userIdsToCheck)
-      return NextResponse.json(result)
+      const norm = toolkit.toLowerCase()
+      let found = toolkits.find((t: any) => t.slug?.toLowerCase() === norm)
+      let isConnected = Boolean(found?.connection?.isActive || found?.isNoAuth)
+
+      // Fallback cross-check jika user terdaftar dengan user.id atau email
+      if (!isConnected && userIdParam && userIdParam !== effectiveUserId) {
+        try {
+          const altSession = await composioService.getOrCreateSession(userIdParam)
+          const altToolkits = await composioService.getSessionToolkits(altSession)
+          const altFound = altToolkits.find((t: any) => t.slug?.toLowerCase() === norm)
+          if (altFound?.connection?.isActive) {
+            isConnected = true
+            found = altFound
+          }
+        } catch {}
+      }
+
+      return NextResponse.json({
+        connected: isConnected,
+        status: isConnected ? 'ACTIVE' : 'NOT_CONNECTED',
+        toolkit: norm,
+        account: found?.connection?.connectedAccount || null,
+      })
     }
 
-    // Otherwise, return all active toolkits from Composio
-    const activeToolkits = await composio.getActiveToolkits(userIdsToCheck)
+    const activeToolkits = toolkits
+      .filter((t: any) => t.connection?.isActive || t.isNoAuth)
+      .map((t: any) => t.slug?.toLowerCase())
+
     return NextResponse.json({
       success: true,
       activeToolkits,
     })
   } catch (err: any) {
-    console.error('Error in /api/composio/status:', err)
-    return NextResponse.json({ connected: false, error: err.message }, { status: 500 })
+    console.error('Error in /api/composio/status:', err.message)
+    const isInvalidKey = err.message?.includes('Invalid API key') || err.message?.includes('801')
+    const friendlyMessage = isInvalidKey
+      ? 'Composio API Key tidak valid. Pastikan menggunakan Project API Key backend (berawalan "ak_...") dari dashboard Composio (https://dashboard.composio.dev/settings), bukan Consumer Key ("ck_...").'
+      : err.message
+    return NextResponse.json({ connected: false, error: friendlyMessage }, { status: isInvalidKey ? 401 : 500 })
   }
 }

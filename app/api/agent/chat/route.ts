@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { AgentRuntime } from '@/lib/agent-sdk/runtime'
+import { AgentRuntime, resolveEffectiveModel } from '@/lib/agent-sdk/runtime'
+import { validateAgentModel } from '@/lib/agent-sdk/models/catalog'
+import { composioService } from '@/lib/composio/client'
 
 export async function POST(req: NextRequest) {
   try {
@@ -11,32 +13,55 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'userPrompt is required' }, { status: 400 })
     }
 
-    // Connect to Supabase to fetch agent configuration with 2s timeout protection
+    // Connect to Supabase to fetch agent configuration and authenticated user
     let agentData: any = null
-    let authUserEmail: string | undefined = undefined
+    let authUserId: string | undefined = undefined
+    let supabaseClient: any = null
+
     try {
-      const supabase = await createClient()
+      supabaseClient = await createClient()
       const {
         data: { user },
-      } = await supabase.auth.getUser()
-      authUserEmail = user?.email || undefined
+      } = await supabaseClient.auth.getUser()
+      authUserId = user?.id || user?.email || undefined
 
-      const fetchPromise = supabase.from('agents').select('*').eq('id', agentId).single()
-      const timeoutPromise = new Promise<any>((resolve) =>
-        setTimeout(() => resolve({ data: null, error: 'timeout' }), 2000)
-      )
-      const res = await Promise.race([fetchPromise, timeoutPromise])
-      agentData = res?.data || null
+      if (agentId) {
+        const { data } = await supabaseClient.from('agents').select('*').eq('id', agentId).single()
+        agentData = data || null
+      }
     } catch (e) {
       console.warn('Supabase agentData fetch warning:', e)
     }
 
-    const agentName = agentData?.name || body.agentName || 'OpenAI Agent'
+    const agentName = agentData?.name || body.agentName || 'Grok AI Agent'
     const agentInstructions = agentData?.system_prompt || agentData?.description || body.instructions || ''
-    const agentModel = agentData?.model || body.model || process.env.OPENAI_DEFAULT_MODEL || 'gpt-4o-mini'
-    const connectedTools = body.connectedTools || agentData?.tools || []
-    const composioSessionId = body.composioSessionId || agentData?.composio_session_id || null
-    const effectiveUserId = authUserEmail || body.userId || 'default_user'
+    const requestedModel = body.model || agentData?.model
+    const agentModel = resolveEffectiveModel(requestedModel)
+
+    // Validasi kelayakan model terhadap katalog OpenRouter (KEBUTUHAN C)
+    const validation = await validateAgentModel(agentModel)
+    if (!validation.valid && validation.reason?.includes('tidak mendukung tool')) {
+      return NextResponse.json(
+        {
+          error: `⚠️ Mode Agent Memerlukan Tool: ${validation.reason} Silakan pilih model yang mendukung tools di katalog OpenRouter.`,
+        },
+        { status: 400 }
+      )
+    }
+
+    const composioSessionId = agentData?.composio_session_id || body.composioSessionId || null
+    // Secure user_id from server authentication session or database agent owner (AGENTS.md §6.3)
+    const rawUserId = authUserId || body.userId || agentData?.user_id || 'default_user'
+    const effectiveUserId = await composioService.resolveCanonicalUserId(rawUserId)
+
+    const rawTools: string[] = Array.isArray(body.connectedTools)
+      ? body.connectedTools
+      : Array.isArray(agentData?.tools)
+      ? agentData.tools
+      : ['gmail']
+    if (!rawTools.includes('gmail')) {
+      rawTools.push('gmail')
+    }
 
     const runtime = new AgentRuntime({
       agentId: agentId || 'default-agent',
@@ -44,8 +69,8 @@ export async function POST(req: NextRequest) {
       instructions: agentInstructions,
       model: agentModel,
       composioSessionId,
-      connectedTools,
       userId: effectiveUserId,
+      connectedTools: rawTools,
     })
 
     // Create a streaming SSE response
@@ -66,6 +91,18 @@ export async function POST(req: NextRequest) {
           })
 
           for await (const event of generator) {
+            // If final_response carries a new composioSessionId and we have agentId, persist to database
+            if (event.type === 'final_response' && event.data?.composioSessionId && agentId && supabaseClient) {
+              const newSid = event.data.composioSessionId
+              if (newSid !== composioSessionId) {
+                supabaseClient
+                  .from('agents')
+                  .update({ composio_session_id: newSid })
+                  .eq('id', agentId)
+                  .then(undefined, console.warn)
+              }
+            }
+
             const chunk = `data: ${JSON.stringify(event)}\n\n`
             controller.enqueue(encoder.encode(chunk))
           }

@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { AgentResponse } from './schema/routine'
 
 /**
  * 8 Execution Steps from "How Agent SDK Works"
@@ -31,20 +32,22 @@ export interface ApprovalRequest {
   timestamp: string
 }
 
+export interface AgentExecutionContext {
+  agentId: string
+  agentName?: string
+  systemPrompt?: string | null
+  userId: string
+  conversationId?: string
+  sessionId?: string
+  composioSession?: any
+}
+
 export interface AgentToolDefinition {
   name: string
   description: string
   parameters: z.ZodObject<any>
   requireApproval?: boolean
   execute: (args: any, context: AgentExecutionContext) => Promise<any>
-}
-
-export interface AgentExecutionContext {
-  agentId: string
-  agentName: string
-  systemPrompt?: string | null
-  userId?: string
-  conversationId?: string
 }
 
 export interface RecurringTaskSchema {
@@ -63,12 +66,10 @@ export interface AgentRuntimeConfig {
   tools?: AgentToolDefinition[]
   temperature?: number
   maxTurns?: number
-  composioSessionId?: string
+  composioSessionId?: string | null
   connectedTools?: string[]
   userId?: string
 }
-
-import { AgentResponse } from './schema/routine'
 
 export interface AgentStreamEvent {
   type:
@@ -76,6 +77,7 @@ export interface AgentStreamEvent {
     | 'step_update'
     | 'step_complete'
     | 'approval_required'
+    | 'connect_required'
     | 'token'
     | 'final_response'
     | 'error'

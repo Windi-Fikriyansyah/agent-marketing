@@ -17,7 +17,7 @@ export const metadata: Metadata = {
   description: "Production-grade Supabase authentication, PostgreSQL database, and management console",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html
       lang="en"

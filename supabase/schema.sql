@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS public.agents (
   user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   description TEXT,
-  model TEXT DEFAULT 'grok-2' NOT NULL,
+  model TEXT DEFAULT 'nvidia/nemotron-3-ultra-550b-a55b:free' NOT NULL,
   system_prompt TEXT,
   avatar TEXT,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,

@@ -32,7 +32,7 @@ function DashboardView() {
   // Edit Agent form states
   const [editName, setEditName] = useState('')
   const [editDescription, setEditDescription] = useState('')
-  const [editModel, setEditModel] = useState('grok-2')
+  const [editModel, setEditModel] = useState('gemini-flash-latest')
   const [editPrompt, setEditPrompt] = useState('')
   const [savingEdit, setSavingEdit] = useState(false)
   const [saveSuccess, setSaveSuccess] = useState(false)
@@ -105,7 +105,7 @@ function DashboardView() {
     if (selectedAgent) {
       setEditName(selectedAgent.name || '')
       setEditDescription(selectedAgent.description || '')
-      setEditModel(selectedAgent.model || 'grok-2')
+      setEditModel(selectedAgent.model && !selectedAgent.model.includes('grok') ? selectedAgent.model : 'gemini-flash-latest')
       setEditPrompt(selectedAgent.system_prompt || '')
       setChatLog([])
       setSaveSuccess(false)
@@ -311,9 +311,23 @@ function DashboardView() {
                       onChange={(e) => setEditModel(e.target.value)}
                       className="dev-input w-full px-3 py-2 rounded text-xs bg-white"
                     >
-                      <option value="grok-2">Grok 2 (State of the art)</option>
-                      <option value="grok-beta">Grok Beta (Fast reasoning)</option>
-                      <option value="grok-vision-beta">Grok Vision (Multimodal)</option>
+                      <optgroup label="Model Gratis (OpenRouter - Agent Ready)">
+                        <option value="nvidia/nemotron-3-ultra-550b-a55b:free">NVIDIA Nemotron 3 Ultra 550B (Free - 1M Context)</option>
+                        <option value="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free">NVIDIA Nemotron 3 Nano Omni (Free - 256k Context)</option>
+                        <option value="thinkingmachines/inkling:free">ThinkingMachines: Inkling (Free - 1M Context)</option>
+                      </optgroup>
+                      <optgroup label="OpenAI (via OpenRouter)">
+                        <option value="openai/gpt-4o">OpenAI GPT-4o</option>
+                        <option value="openai/gpt-4o-mini">OpenAI GPT-4o Mini</option>
+                      </optgroup>
+                      <optgroup label="Anthropic (via OpenRouter)">
+                        <option value="anthropic/claude-3.5-sonnet">Claude 3.5 Sonnet</option>
+                        <option value="anthropic/claude-3.5-haiku">Claude 3.5 Haiku</option>
+                      </optgroup>
+                      <optgroup label="Google (via OpenRouter)">
+                        <option value="google/gemini-2.5-flash">Gemini 2.5 Flash</option>
+                        <option value="google/gemini-flash-1.5">Gemini 1.5 Flash</option>
+                      </optgroup>
                     </select>
                   </div>
 

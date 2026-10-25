@@ -40,7 +40,7 @@ import {
   RotateCcw,
 } from 'lucide-react'
 import { AgentStepTrace, ApprovalRequest, RecurringTaskSchema } from '@/lib/agent-sdk/types'
-import { buildAgentInstructions } from '@/lib/composio/client'
+import { buildAgentInstructions } from '@/lib/agent-sdk/instructions'
 import { AgentResponseView } from '@/components/routine/AgentResponseView'
 import { AgentResponse, RoutineDraft } from '@/lib/agent-sdk/schema/routine'
 
@@ -255,11 +255,50 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
   const [connectedTools, setConnectedTools] = useState<string[]>([])
 
   // Composio & Recurring Task state (Phase 1 & Phase 2 from flow diagram)
-  const [composioSessionId, setComposioSessionId] = useState<string>('cs_m8412k9s01')
+  const [composioSessionId, setComposioSessionId] = useState<string>('')
   const [copiedSessionId, setCopiedSessionId] = useState(false)
   const [generatingSession, setGeneratingSession] = useState(false)
   const [recurringTask, setRecurringTask] = useState<RecurringTaskSchema | null>(null)
-  const [modelName, setModelName] = useState<string>('GPT-4o')
+  const [modelName, setModelName] = useState<string>('thinkingmachines/inkling:free')
+  const [modelCatalog, setModelCatalog] = useState<any[]>([])
+  const [loadingModels, setLoadingModels] = useState(false)
+  const [modelSearch, setModelSearch] = useState('')
+  const [savingModel, setSavingModel] = useState(false)
+
+  // Load OpenRouter dynamic model catalog (KEBUTUHAN B & C)
+  useEffect(() => {
+    async function loadModels() {
+      try {
+        setLoadingModels(true)
+        const res = await fetch('/api/models')
+        const data = await res.json()
+        if (data.models && Array.isArray(data.models)) {
+          setModelCatalog(data.models)
+        }
+      } catch (e) {
+        console.warn('Gagal memuat katalog model OpenRouter:', e)
+      } finally {
+        setLoadingModels(false)
+      }
+    }
+    loadModels()
+  }, [])
+
+  const handleModelChange = async (newModelId: string) => {
+    setModelName(newModelId)
+    try {
+      setSavingModel(true)
+      await fetch('/api/models', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentId, modelId: newModelId }),
+      })
+    } catch (e) {
+      console.warn('Gagal menyimpan model ke database:', e)
+    } finally {
+      setSavingModel(false)
+    }
+  }
 
   // Dynamic categories from database tools
   const availableCategories = useMemo(() => {
@@ -369,7 +408,11 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
             fetch('/api/composio/session', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ agentId, toolkits: data.tools || [] }),
+              body: JSON.stringify({
+                agentId,
+                toolkits: data.tools || [],
+                userId: currentUser?.id || currentUser?.email,
+              }),
             })
               .then((r) => r.json())
               .then((resData) => {
@@ -603,6 +646,8 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
           approvedAction: approvedAction || null,
           composioSessionId,
           connectedTools: toolsToUse,
+          model: modelName,
+          userId: user?.id || user?.email,
         }),
       })
 
@@ -642,6 +687,50 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                   }
                 }
 
+                if (event.type === 'token') {
+                  const token = event.data?.token || ''
+                  return {
+                    ...m,
+                    traces,
+                    content: (m.content || '') + token,
+                  }
+                }
+
+                if (event.type === 'connect_required') {
+                  const connectData = event.data || {}
+                  const slug = (connectData.toolkit || '').toLowerCase()
+                  const existingCards = m.toolCards || []
+                  const alreadyExists = existingCards.some((tc) => tc.slug === slug)
+                  const newCards = alreadyExists
+                    ? existingCards
+                    : [
+                        ...existingCards,
+                        {
+                          slug,
+                          name: slug.toUpperCase(),
+                          icon: '',
+                          isConnected: false,
+                          connectLink: connectData.connectLink,
+                          reason: connectData.message || `Diperlukan otorisasi OAuth untuk ${slug.toUpperCase()}`,
+                        },
+                      ]
+                  return {
+                    ...m,
+                    traces,
+                    toolCards: newCards,
+                  }
+                }
+
+                if (event.type === 'error') {
+                  setAgentTyping(false)
+                  const errMsg = event.data?.error || event.error || 'Terjadi kesalahan sistem'
+                  return {
+                    ...m,
+                    traces,
+                    content: (m.content ? m.content + '\n\n' : '') + `⚠️ **Error**: ${errMsg}`,
+                  }
+                }
+
                 if (event.type === 'approval_required') {
                   const apprMsg: ChatMessage = {
                     ...m,
@@ -655,7 +744,7 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
 
                 if (event.type === 'final_response') {
                   setAgentTyping(false)
-                  const finalAnswer = event.data?.answer || event.agentResponse?.message || ''
+                  const finalAnswer = event.data?.answer || m.content || event.agentResponse?.message || ''
                   let taskSchema: RecurringTaskSchema | undefined = event.taskSchema
                   if (!taskSchema && finalAnswer.includes('{') && finalAnswer.includes('"instruction"')) {
                     try {
@@ -696,7 +785,7 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                     content: finalAnswer,
                     taskSchema,
                     response: agentResp || null,
-                    toolCards,
+                    toolCards: toolCards.length > 0 ? toolCards : m.toolCards,
                   }
                 }
 
@@ -920,7 +1009,7 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
     let isReallyConnected = false
     try {
       const verifyRes = await fetch(
-        `/api/composio/status?toolkit=${encodeURIComponent(normalizedSlug)}&userId=${encodeURIComponent(user?.email || agentId || '')}&agentId=${agentId}`
+        `/api/composio/status?toolkit=${encodeURIComponent(normalizedSlug)}&userId=${encodeURIComponent(user?.id || user?.email || agentId || '')}&agentId=${agentId}`
       )
       if (verifyRes.ok) {
         const verifyData = await verifyRes.json()
@@ -1528,7 +1617,7 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                         <p className="text-xs text-amber-900 leading-relaxed">
                           Agent meminta konfirmasi Anda untuk mengeksekusi aksi:
                           <strong className="block mt-0.5 font-mono text-amber-950">
-                            {msg.approvalRequest.toolName} ({msg.approvalRequest.parameters.actionType || 'action'})
+                            {msg.approvalRequest.toolName} ({msg.approvalRequest.parameters?.action || msg.approvalRequest.parameters?.actionType || 'action'})
                           </strong>
                           <span className="text-[11px] text-amber-800 block mt-1">
                             {msg.approvalRequest.reason}
@@ -1929,22 +2018,90 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                   </p>
                 </div>
 
-                {/* 3. Model Selector matching Image 1 */}
-                <div className="space-y-1.5">
-                  <label className="block text-xs font-bold text-slate-900">
-                    Model
-                  </label>
+                {/* 3. OpenRouter Model Selector Dinamis (KEBUTUHAN C) */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="block text-xs font-bold text-slate-900">
+                      Model AI (OpenRouter Gateway)
+                    </label>
+                    {savingModel && (
+                      <span className="text-[10px] text-blue-600 animate-pulse font-medium">Menyimpan...</span>
+                    )}
+                  </div>
+
+                  {/* Search box for models */}
+                  <input
+                    type="text"
+                    value={modelSearch}
+                    onChange={(e) => setModelSearch(e.target.value)}
+                    placeholder="Cari model (e.g. claude, gpt, nemotron, deepseek)..."
+                    className="w-full px-2.5 py-1.5 border border-slate-200 rounded-lg text-[11px] text-slate-800 bg-white placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+
                   <select
                     value={modelName}
-                    onChange={(e) => setModelName(e.target.value)}
+                    onChange={(e) => handleModelChange(e.target.value)}
+                    disabled={loadingModels}
                     className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs font-medium text-slate-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all cursor-pointer shadow-2xs"
                   >
-                    <option value="GPT-4o">GPT-4o (Recommended)</option>
-                    <option value="gpt-4o-mini">GPT-4o Mini (Fast &amp; Efficient)</option>
-                    <option value="gemini-flash-latest">Gemini Flash Latest (Google)</option>
-                    <option value="gemini-2.5-flash">Gemini 2.5 Flash (Google)</option>
-                    <option value="gemini-1.5-flash">Gemini 1.5 Flash (Google)</option>
+                    {/* Default free models group */}
+                    <optgroup label="Model Rekomendasi Gratis (Agent-Ready)">
+                      <option value="nvidia/nemotron-3-ultra-550b-a55b:free">
+                        NVIDIA Nemotron 3 Ultra 550B (Free - 1M Context - Tools)
+                      </option>
+                      <option value="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free">
+                        NVIDIA Nemotron 3 Nano Omni (Free - 256k Context - Tools)
+                      </option>
+                      <option value="thinkingmachines/inkling:free">
+                        ThinkingMachines: Inkling (Free - 1M Context)
+                      </option>
+                    </optgroup>
+
+                    {/* Dynamic models from OpenRouter catalog */}
+                    {modelCatalog.length > 0 && (
+                      <optgroup label={`Katalog OpenRouter (${modelCatalog.filter((m) => m.isAgentReady).length} Model Layak Agent)`}>
+                        {modelCatalog
+                          .filter((m) => {
+                            if (!modelSearch) return m.isAgentReady
+                            return (
+                              m.id.toLowerCase().includes(modelSearch.toLowerCase()) ||
+                              m.name.toLowerCase().includes(modelSearch.toLowerCase())
+                            )
+                          })
+                          .slice(0, 100)
+                          .map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.name} {!m.isAgentReady ? '⚠️ (No Tools)' : `($${m.pricing.prompt.toFixed(2)}/1M)`}
+                            </option>
+                          ))}
+                      </optgroup>
+                    )}
                   </select>
+
+                  {/* Active Model Capabilities Badge */}
+                  {(() => {
+                    const activeMeta = modelCatalog.find((m) => m.id === modelName)
+                    return (
+                      <div className="flex flex-wrap items-center gap-1.5 pt-1 text-[10px]">
+                        <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200/60 font-semibold">
+                          ✓ Tool Calling
+                        </span>
+                        {activeMeta?.supportsVision && (
+                          <span className="px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-200/60 font-semibold">
+                            👁 Vision
+                          </span>
+                        )}
+                        <span className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 border border-slate-200">
+                          {activeMeta?.contextLength ? `${Math.round(activeMeta.contextLength / 1024)}k Context` : '1000k Context'}
+                        </span>
+                        {activeMeta && (
+                          <span className="px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 border border-amber-200">
+                            ${activeMeta.pricing.prompt.toFixed(2)} / 1M prompt
+                          </span>
+                        )}
+                      </div>
+                    )
+                  })()}
                 </div>
 
                 {/* 4. Task Schedule Badge matching Image 1 */}

@@ -112,7 +112,7 @@ export default function CreateAgentPage() {
         name: agentName.trim(),
         description: instructions.trim() ? instructions.trim().slice(0, 150) : null,
         system_prompt: instructions.trim() || null,
-        model: 'grok-2',
+        model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
         avatar: avatarId,
       }
 
@@ -136,7 +136,7 @@ export default function CreateAgentPage() {
             name: agentName.trim(),
             description: instructions.trim() ? instructions.trim().slice(0, 150) : null,
             system_prompt: instructions.trim() || null,
-            model: 'grok-2',
+            model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
           }
           const { data: retryData, error: retryError } = await supabase
             .from('agents')
