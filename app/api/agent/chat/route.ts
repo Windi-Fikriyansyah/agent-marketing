@@ -7,23 +7,36 @@ export async function POST(req: NextRequest) {
     const body = await req.json()
     const { agentId, userPrompt, conversationHistory, approvedAction } = body
 
-    if (!userPrompt && !approvedAction) {
+    if (!userPrompt && !approvedAction && (!conversationHistory || conversationHistory.length === 0)) {
       return NextResponse.json({ error: 'userPrompt is required' }, { status: 400 })
     }
 
-    // Connect to Supabase to fetch agent configuration
-    const supabase = await createClient()
-    const { data: agentData } = await supabase
-      .from('agents')
-      .select('*')
-      .eq('id', agentId)
-      .single()
+    // Connect to Supabase to fetch agent configuration with 2s timeout protection
+    let agentData: any = null
+    let authUserEmail: string | undefined = undefined
+    try {
+      const supabase = await createClient()
+      const {
+        data: { user },
+      } = await supabase.auth.getUser()
+      authUserEmail = user?.email || undefined
 
-    const agentName = agentData?.name || 'OpenAI Agent'
-    const agentInstructions = agentData?.system_prompt || agentData?.description || ''
+      const fetchPromise = supabase.from('agents').select('*').eq('id', agentId).single()
+      const timeoutPromise = new Promise<any>((resolve) =>
+        setTimeout(() => resolve({ data: null, error: 'timeout' }), 2000)
+      )
+      const res = await Promise.race([fetchPromise, timeoutPromise])
+      agentData = res?.data || null
+    } catch (e) {
+      console.warn('Supabase agentData fetch warning:', e)
+    }
+
+    const agentName = agentData?.name || body.agentName || 'OpenAI Agent'
+    const agentInstructions = agentData?.system_prompt || agentData?.description || body.instructions || ''
     const agentModel = agentData?.model || body.model || process.env.OPENAI_DEFAULT_MODEL || 'gpt-4o-mini'
-    const connectedTools = agentData?.tools || body.connectedTools || []
-    const composioSessionId = agentData?.composio_session_id || body.composioSessionId || null
+    const connectedTools = body.connectedTools || agentData?.tools || []
+    const composioSessionId = body.composioSessionId || agentData?.composio_session_id || null
+    const effectiveUserId = authUserEmail || body.userId || 'default_user'
 
     const runtime = new AgentRuntime({
       agentId: agentId || 'default-agent',
@@ -32,6 +45,7 @@ export async function POST(req: NextRequest) {
       model: agentModel,
       composioSessionId,
       connectedTools,
+      userId: effectiveUserId,
     })
 
     // Create a streaming SSE response
@@ -39,7 +53,14 @@ export async function POST(req: NextRequest) {
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          const generator = runtime.execute(userPrompt || '', {
+          const rawPrompt = (userPrompt || '').trim()
+          const effectivePrompt =
+            rawPrompt ||
+            (approvedAction
+              ? `Pengguna telah menyetujui eksekusi aksi ${approvedAction.toolName}. Lanjutkan eksekusi.`
+              : 'Lanjutkan interaksi.')
+
+          const generator = runtime.execute(effectivePrompt, {
             conversationHistory: conversationHistory || [],
             approvedAction: approvedAction || null,
           })

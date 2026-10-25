@@ -41,6 +41,8 @@ import {
 } from 'lucide-react'
 import { AgentStepTrace, ApprovalRequest, RecurringTaskSchema } from '@/lib/agent-sdk/types'
 import { buildAgentInstructions } from '@/lib/composio/client'
+import { AgentResponseView } from '@/components/routine/AgentResponseView'
+import { AgentResponse, RoutineDraft } from '@/lib/agent-sdk/schema/routine'
 
 // Avatar presets
 const AVATAR_COLORS = [
@@ -218,6 +220,8 @@ export interface ChatMessage {
   approvalRequest?: ApprovalRequest | null
   approvalStatus?: 'pending' | 'approved' | 'rejected'
   taskSchema?: RecurringTaskSchema
+  response?: AgentResponse | null
+  toolCards?: any[]
 }
 
 interface WorkspaceAgentClientProps {
@@ -357,12 +361,23 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
           setDescription(data.description || '')
           setAvatarString(data.avatar || 'orange-circle-happy')
 
-          // Load composio_session_id or generate session matching Image 1 Step 5
-          if (data.composio_session_id) {
+          // Load composio_session_id: reuse existing if available, or generate and persist to DB
+          if (data.composio_session_id && data.composio_session_id.trim().length > 0) {
             setComposioSessionId(data.composio_session_id)
           } else {
-            const fallbackId = 'cs_m8412k9s' + Math.random().toString(36).substring(2, 6)
-            setComposioSessionId(fallbackId)
+            // Agent does not have session ID yet: initialize and persist to database
+            fetch('/api/composio/session', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ agentId, toolkits: data.tools || [] }),
+            })
+              .then((r) => r.json())
+              .then((resData) => {
+                if (resData.sessionId) {
+                  setComposioSessionId(resData.sessionId)
+                }
+              })
+              .catch(console.warn)
           }
 
           // Load Phase 2 Recurring Task Schema if saved in database
@@ -417,12 +432,24 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
             setLoadingTools(false)
           }
 
-          // Load connected tools for agent if saved in database
-          if (data.tools && Array.isArray(data.tools)) {
-            setConnectedTools(data.tools)
-          } else {
-            setConnectedTools([])
-          }
+          // Load connected tools for agent and synchronize strictly with Composio active status
+          const rawDbTools = data.tools && Array.isArray(data.tools) ? data.tools : []
+          setConnectedTools(rawDbTools)
+
+          // Strict verification with Composio API: only tools with ACTIVE status in Composio are considered connected
+          fetch(`/api/composio/status?userId=${encodeURIComponent(data.user_id || user?.email || '')}&agentId=${agentId}`)
+            .then((r) => r.json())
+            .then((statusRes) => {
+              if (statusRes.activeToolkits && Array.isArray(statusRes.activeToolkits)) {
+                const realActive = statusRes.activeToolkits.map((t: string) => t.toLowerCase())
+                setConnectedTools(realActive)
+                // If database had tools that are no longer active, sync the database
+                if (JSON.stringify([...rawDbTools].sort()) !== JSON.stringify([...realActive].sort())) {
+                  supabase.from('agents').update({ tools: realActive }).eq('id', agentId).then(undefined, console.warn)
+                }
+              }
+            })
+            .catch(console.warn)
 
           // 1. Try to load chat history directly from Supabase
           let loadedFromSupabase = false
@@ -434,18 +461,23 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
               .order('created_at', { ascending: true })
 
             if (!msgError && dbMessages) {
-              const formatted: ChatMessage[] = dbMessages.map((row) => ({
-                id: row.id,
-                role: row.role as 'user' | 'agent',
-                content: row.content || '',
-                timestamp: new Date(row.created_at).toLocaleTimeString('id-ID', {
-                  hour: '2-digit',
-                  minute: '2-digit',
-                }),
-                traces: row.traces || [],
-                approvalRequest: row.approval_request || undefined,
-                approvalStatus: row.approval_status || undefined,
-              }))
+              const formatted: ChatMessage[] = dbMessages.map((row) => {
+                const step8 = row.traces?.find((t: any) => t.step === 'final_response')
+                const response: AgentResponse | null = step8?.details?.agentResponse || (row as any).response || null
+                return {
+                  id: row.id,
+                  role: row.role as 'user' | 'agent',
+                  content: row.content || '',
+                  timestamp: new Date(row.created_at).toLocaleTimeString('id-ID', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  }),
+                  traces: row.traces || [],
+                  approvalRequest: row.approval_request || undefined,
+                  approvalStatus: row.approval_status || undefined,
+                  response,
+                }
+              })
               setChatMessages(formatted)
               localStorage.setItem(`grok_bot_chat_${agentId}`, JSON.stringify(formatted))
               loadedFromSupabase = true
@@ -538,7 +570,12 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
   }
 
   // Stream execution from Agent SDK API
-  const runAgentStream = async (userText: string, currentHistory: ChatMessage[], approvedAction?: any) => {
+  const runAgentStream = async (
+    userText: string,
+    currentHistory: ChatMessage[],
+    approvedAction?: any,
+    overrideConnectedTools?: string[]
+  ) => {
     const agentMsgId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `agent_${Date.now()}`
     const placeholderMsg: ChatMessage = {
       id: agentMsgId,
@@ -555,6 +592,7 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
     setExpandedTraceMsgId(agentMsgId)
 
     try {
+      const toolsToUse = overrideConnectedTools || connectedTools
       const res = await fetch('/api/agent/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -564,7 +602,7 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
           conversationHistory: currentHistory.map((m) => ({ role: m.role, content: m.content })),
           approvedAction: approvedAction || null,
           composioSessionId,
-          connectedTools,
+          connectedTools: toolsToUse,
         }),
       })
 
@@ -615,11 +653,13 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                   return apprMsg
                 }
 
-                if (event.type === 'final_response' && event.data?.answer) {
+                if (event.type === 'final_response') {
+                  setAgentTyping(false)
+                  const finalAnswer = event.data?.answer || event.agentResponse?.message || ''
                   let taskSchema: RecurringTaskSchema | undefined = event.taskSchema
-                  if (!taskSchema && event.data.answer.includes('{') && event.data.answer.includes('"instruction"')) {
+                  if (!taskSchema && finalAnswer.includes('{') && finalAnswer.includes('"instruction"')) {
                     try {
-                      const match = event.data.answer.match(/\{[\s\S]*?"instruction"[\s\S]*?\}/)
+                      const match = finalAnswer.match(/\{[\s\S]*?"instruction"[\s\S]*?\}/)
                       if (match) taskSchema = JSON.parse(match[0])
                     } catch {}
                   }
@@ -634,11 +674,29 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                     }).catch(console.warn)
                   }
 
+                  const agentResp: AgentResponse | undefined = event.agentResponse
+                  const requiredSlugs = (agentResp?.routine?.tools || agentResp?.suggestedTools || []).map((t) => t.slug.toLowerCase())
+                  const toolCards = requiredSlugs.map((slug) => {
+                    const dbTool = toolsList.find((t) => t.slug.toLowerCase() === slug)
+                    return {
+                      slug,
+                      name: dbTool?.name || slug.toUpperCase(),
+                      icon: dbTool?.icon || '',
+                      isConnected: toolsToUse.map((c) => c.toLowerCase()).includes(slug),
+                      reason:
+                        agentResp?.routine?.tools?.find((t) => t.slug.toLowerCase() === slug)?.reason ||
+                        agentResp?.suggestedTools?.find((t) => t.slug.toLowerCase() === slug)?.reason ||
+                        'Integrasi aplikasi untuk eksekusi otomatis',
+                    }
+                  })
+
                   return {
                     ...m,
                     traces,
-                    content: event.data.answer,
+                    content: finalAnswer,
                     taskSchema,
+                    response: agentResp || null,
+                    toolCards,
                   }
                 }
 
@@ -677,12 +735,11 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
     }
   }
 
-  // Send message
-  const handleSendMessage = (e?: React.FormEvent) => {
-    if (e) e.preventDefault()
-    if (!chatInput.trim() || agentTyping) return
+  // Send text message (used by form submit and Generative UI option buttons)
+  const sendMessageText = (text: string) => {
+    if (!text.trim() || agentTyping) return
 
-    const userText = chatInput.trim()
+    const userText = text.trim()
     setChatInput('') // Empty input immediately
 
     const now = new Date().toLocaleTimeString('id-ID', {
@@ -704,6 +761,210 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
     persistMessageToSupabase(newUserMsg)
 
     runAgentStream(userText, updatedWithUser)
+  }
+
+  // Send message from chat form
+  const handleSendMessage = (e?: React.FormEvent) => {
+    if (e) e.preventDefault()
+    sendMessageText(chatInput)
+  }
+
+  // Handle Create Routine action from Generative UI RoutineCard (Image 5 & Image 1 Step 6)
+  const handleCreateRoutineFromDraft = async (routine: RoutineDraft, msgId?: string) => {
+    try {
+      // 1. Update schedule settings in workspace state
+      setScheduleMode('recurring')
+      setScheduleFrequency(routine.schedule.frequency || 'weekly')
+      if (routine.schedule.time) {
+        setScheduleTime(routine.schedule.time)
+      }
+      if (routine.schedule.weekdays && routine.schedule.weekdays.length > 0) {
+        const dayMap: Record<string, string> = {
+          MO: 'Mon',
+          TU: 'Tue',
+          WE: 'Wed',
+          TH: 'Thu',
+          FR: 'Fri',
+          SA: 'Sat',
+          SU: 'Sun',
+        }
+        setSelectedDays(routine.schedule.weekdays.map((d) => dayMap[d] || d))
+      }
+
+      const newSchema: RecurringTaskSchema = {
+        instruction: routine.instructions || routine.name,
+        route: routine.tools?.[0]?.slug || 'slack',
+        time: routine.schedule?.time || '08:00 AM',
+        frequency: (routine.schedule?.frequency as any) || 'weekly',
+      }
+      setRecurringTask(newSchema)
+
+      // 2. Persist to routines database table and agent configuration
+      if (user && agentId) {
+        try {
+          const { error: routineErr } = await supabase.from('routines').upsert({
+            agent_id: agentId,
+            user_email: user.email || 'user@orbit.local',
+            name: routine.name,
+            goal: routine.goal,
+            instructions: routine.instructions,
+            schedule: routine.schedule,
+            tools: routine.tools,
+            is_active: true,
+          })
+          if (routineErr) {
+            console.warn('Could not insert to routines table:', routineErr)
+          }
+        } catch (dbErr) {
+          console.warn('Could not insert to routines table:', dbErr)
+        }
+
+        // Also update agent recurring task schema in Supabase
+        try {
+          const { error: agentErr } = await supabase
+            .from('agents')
+            .update({
+              recurring_task_schema: newSchema,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', agentId)
+          if (agentErr) {
+            console.warn('Could not update agent recurring_task_schema:', agentErr)
+          }
+        } catch (agentErr) {
+          console.warn('Could not update agent in Supabase:', agentErr)
+        }
+      }
+
+      // 3. Mark message state as 'completed'
+      if (msgId) {
+        setChatMessages((prev) =>
+          prev.map((m) => {
+            if (m.id === msgId && m.response) {
+              const updatedResp: AgentResponse = {
+                ...m.response,
+                type: 'completed',
+                message: `Routine "${routine.name}" telah aktif dan tersimpan di database.`,
+              }
+              const updatedMsg = { ...m, response: updatedResp }
+              persistMessageToSupabase(updatedMsg)
+              return updatedMsg
+            }
+            return m
+          })
+        )
+      }
+    } catch (err) {
+      console.error('Failed to create routine:', err)
+    }
+  }
+
+  // Handle direct tool connection with Real Composio OAuth Request
+  const handleConnectTool = async (slug: string, autoAdvanceChat: boolean = true) => {
+    const normalizedSlug = slug.toLowerCase()
+
+    // 1. Request real Composio OAuth connection link
+    try {
+      const res = await fetch('/api/composio/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          toolkit: normalizedSlug,
+          userId: user?.email || agentId || 'default_user',
+        }),
+      })
+
+      if (res.ok) {
+        const data = await res.json()
+        if (data.redirectUrl) {
+          // Open Composio OAuth authorization window
+          const width = 600
+          const height = 750
+          const left = window.screen.width / 2 - width / 2
+          const top = window.screen.height / 2 - height / 2
+          const popup = window.open(
+            data.redirectUrl,
+            `composio_connect_${normalizedSlug}`,
+            `width=${width},height=${height},top=${top},left=${left},resizable=yes,scrollbars=yes,status=yes`
+          )
+
+          // Wait for authorization to complete via popup postMessage or popup close
+          await new Promise<void>((resolve) => {
+            const handleMessage = (e: MessageEvent) => {
+              if (e.data?.type === 'COMPOSIO_OAUTH_SUCCESS') {
+                window.removeEventListener('message', handleMessage)
+                clearInterval(checkTimer)
+                resolve()
+              }
+            }
+            window.addEventListener('message', handleMessage)
+
+            const checkTimer = setInterval(() => {
+              if (!popup || popup.closed) {
+                clearInterval(checkTimer)
+                window.removeEventListener('message', handleMessage)
+                resolve()
+              }
+            }, 1000)
+          })
+        }
+      }
+    } catch (oauthErr) {
+      console.warn('Composio OAuth flow warning:', oauthErr)
+    }
+
+    // 2. Wait a moment for Composio webhooks / callback to finalize
+    await new Promise((r) => setTimeout(r, 1500))
+
+    // 3. Strictly verify with Composio API if this toolkit is ACTUALLY connected and ACTIVE
+    let isReallyConnected = false
+    try {
+      const verifyRes = await fetch(
+        `/api/composio/status?toolkit=${encodeURIComponent(normalizedSlug)}&userId=${encodeURIComponent(user?.email || agentId || '')}&agentId=${agentId}`
+      )
+      if (verifyRes.ok) {
+        const verifyData = await verifyRes.json()
+        isReallyConnected = Boolean(verifyData.connected)
+      }
+    } catch (vErr) {
+      console.warn('Could not verify status with Composio:', vErr)
+    }
+
+    if (!isReallyConnected) {
+      console.warn(`[Composio OAuth] ${normalizedSlug} was NOT connected. Modal closed without active authorization.`)
+      alert(
+        `Otorisasi ${normalizedSlug.toUpperCase()} belum selesai atau jendela ditutup sebelum login selesai. Status belum terhubung di Composio.`
+      )
+      return
+    }
+
+    // 4. Real connection confirmed: Update connected tools state and database
+    const updatedTools = Array.from(new Set([...connectedTools.map((t) => t.toLowerCase()), normalizedSlug]))
+    setConnectedTools(updatedTools)
+
+    // Save to agents table in Supabase
+    if (agentId) {
+      try {
+        await supabase.from('agents').update({ tools: updatedTools }).eq('id', agentId)
+      } catch (err) {
+        console.warn('Could not update agent tools in Supabase:', err)
+      }
+    }
+
+    // Update existing message cards to show this tool as connected immediately
+    const updatedHistory = chatMessages.map((m) => {
+      const toolCards = m.toolCards?.map((tc) =>
+        tc.slug.toLowerCase() === normalizedSlug ? { ...tc, isConnected: true } : tc
+      )
+      return { ...m, toolCards }
+    })
+    setChatMessages(updatedHistory)
+    saveChatToStorage(updatedHistory)
+
+    // Automatically advance conversation if requested
+    if (autoAdvanceChat) {
+      await runAgentStream(`Aplikasi ${normalizedSlug.toUpperCase()} telah terhubung. Lanjutkan setup routine.`, updatedHistory, null, updatedTools)
+    }
   }
 
   // Handle Human-in-the-Loop Approval Action (Step 7)
@@ -894,36 +1155,45 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
   }
 
   // Generate / Refresh Composio Session (Phase 1 Step 5)
-  const handleCreateComposioSession = async () => {
+  const handleCreateComposioSession = async (force: boolean = false) => {
     setGeneratingSession(true)
     try {
       const res = await fetch('/api/composio/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agentId, toolkits: connectedTools }),
+        body: JSON.stringify({ agentId, toolkits: connectedTools, forceNew: force }),
       })
       if (res.ok) {
         const data = await res.json()
         if (data.sessionId) {
           setComposioSessionId(data.sessionId)
         }
-      } else {
-        const fallbackId = 'cs_m8412k9s' + Math.random().toString(36).substring(2, 6)
-        setComposioSessionId(fallbackId)
       }
-    } catch {
-      const fallbackId = 'cs_m8412k9s' + Math.random().toString(36).substring(2, 6)
-      setComposioSessionId(fallbackId)
+    } catch (e) {
+      console.warn('Failed to get/generate Composio session:', e)
     } finally {
       setGeneratingSession(false)
     }
   }
 
-  // Tool Connection Toggle
-  const toggleConnectTool = (toolId: string) => {
-    setConnectedTools((prev) =>
-      prev.includes(toolId) ? prev.filter((t) => t !== toolId) : [...prev, toolId]
-    )
+  // Tool Connection Toggle with Real Composio OAuth
+  const toggleConnectTool = async (toolId: string) => {
+    const isCurrentlyConnected = connectedTools.includes(toolId)
+    if (isCurrentlyConnected) {
+      const updated = connectedTools.filter((t) => t !== toolId)
+      setConnectedTools(updated)
+      if (agentId) {
+        try {
+          await supabase.from('agents').update({ tools: updated }).eq('id', agentId)
+        } catch (err) {
+          console.warn('Failed to update tools in Supabase:', err)
+        }
+      }
+      return
+    }
+
+    // Connect via real OAuth
+    await handleConnectTool(toolId, false)
   }
 
   // Schedule Day Toggle
@@ -1286,15 +1556,25 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                       </div>
                     )}
 
-                    {/* Message Bubble Card */}
-                    {msg.content && (
-                      <div className="space-y-2">
-                        <div className="bg-white border border-slate-200 rounded-2xl px-5 py-3.5 text-sm text-slate-800 leading-relaxed shadow-xs whitespace-pre-wrap">
-                          {msg.content}
+                    {/* Message Bubble Card with Generative UI */}
+                    {(msg.content || msg.response) && (
+                      <div className="space-y-3">
+                        <div className="bg-white border border-slate-200 rounded-2xl px-5 py-4 text-sm text-slate-800 leading-relaxed shadow-xs">
+                          <AgentResponseView
+                            message={msg}
+                            connectedTools={connectedTools}
+                            onOptionSelect={(selectedText) => {
+                              sendMessageText(selectedText)
+                            }}
+                            onCreateRoutine={async (draft) => {
+                              await handleCreateRoutineFromDraft(draft, msg.id)
+                            }}
+                            onConnectTool={handleConnectTool}
+                          />
                         </div>
 
-                        {/* Phase 2: AI Generates Structured Output (Task Schema Card) */}
-                        {msg.taskSchema && (
+                        {/* Phase 2: AI Generates Structured Output (Task Schema Card) if not already routine card */}
+                        {msg.taskSchema && !msg.response?.routine && (
                           <div className="p-4 rounded-2xl bg-gradient-to-br from-slate-900 to-slate-950 text-white border border-slate-800 text-xs space-y-3 shadow-md animate-in fade-in duration-200">
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2">
@@ -1635,10 +1915,10 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                       </button>
                       <button
                         type="button"
-                        onClick={handleCreateComposioSession}
+                        onClick={() => handleCreateComposioSession(true)}
                         disabled={generatingSession}
                         className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors cursor-pointer"
-                        title="Buat / Segarkan Session Composio"
+                        title="Buat Baru / Segarkan Session Composio"
                       >
                         <RefreshCw className={`w-3.5 h-3.5 ${generatingSession ? 'animate-spin text-blue-600' : ''}`} />
                       </button>
@@ -1661,7 +1941,9 @@ export default function WorkspaceAgentClient({ agentId }: WorkspaceAgentClientPr
                   >
                     <option value="GPT-4o">GPT-4o (Recommended)</option>
                     <option value="gpt-4o-mini">GPT-4o Mini (Fast &amp; Efficient)</option>
+                    <option value="gemini-flash-latest">Gemini Flash Latest (Google)</option>
                     <option value="gemini-2.5-flash">Gemini 2.5 Flash (Google)</option>
+                    <option value="gemini-1.5-flash">Gemini 1.5 Flash (Google)</option>
                   </select>
                 </div>
 

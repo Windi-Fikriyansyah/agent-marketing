@@ -62,16 +62,15 @@ export async function callGemini(options: GeminiCallOptions): Promise<{
       }
     }
 
-    // Ordered candidate models for automatic multi-model redundancy
+    // Use requested model first, then known fallback models if needed
     const candidateModels = Array.from(
       new Set([
-        model || 'gemini-flash-latest',
-        'gemini-flash-latest',
-        'gemini-flash-lite-latest',
-        'gemini-3.5-flash',
+        model || 'gemini-2.5-flash',
         'gemini-2.5-flash',
+        'gemini-flash-latest',
+        'gemini-2.5-flash-lite',
       ])
-    )
+    ).filter(Boolean)
 
     let lastError = 'No models available'
 
@@ -79,6 +78,7 @@ export async function callGemini(options: GeminiCallOptions): Promise<{
       try {
         const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${apiKey.trim()}`
 
+        // Wait for response from Gemini AI without premature 5s timeout
         const res = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -103,8 +103,8 @@ export async function callGemini(options: GeminiCallOptions): Promise<{
           }
         }
       } catch (err: any) {
-        lastError = err.message || 'Network error'
-        console.warn(`Gemini model ${currentModel} network error, trying next candidate...`, err)
+        lastError = err.message || 'Network error calling Gemini API'
+        console.warn(`Gemini model ${currentModel} error:`, lastError)
       }
     }
 

@@ -65,7 +65,10 @@ export interface AgentRuntimeConfig {
   maxTurns?: number
   composioSessionId?: string
   connectedTools?: string[]
+  userId?: string
 }
+
+import { AgentResponse } from './schema/routine'
 
 export interface AgentStreamEvent {
   type:
@@ -81,4 +84,5 @@ export interface AgentStreamEvent {
   trace?: AgentStepTrace
   data?: any
   taskSchema?: RecurringTaskSchema
+  agentResponse?: AgentResponse
 }
